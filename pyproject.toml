@@ -1,0 +1,24 @@
+[project]
+name = "pi-cloud-run"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.40.21",
+    "cloudpickle>=3.0.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "ruff>=0.12.11",
+    "moto[all]>=5.0.15",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cloud_run"]
