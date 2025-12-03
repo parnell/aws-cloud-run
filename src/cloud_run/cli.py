@@ -153,8 +153,8 @@ def main():
     )
     parser.add_argument(
         '--region',
-        default='us-east-2',
-        help='AWS region (default: us-east-2)'
+        default=None,
+        help='AWS region (default: from AWS config/profile)'
     )
     
     args = parser.parse_args()
@@ -171,6 +171,15 @@ def main():
     # Detect script type
     script_type = _detect_script_type(script_path, script_content)
     
+    # Get region from args, or fall back to AWS config/profile default
+    region = args.region
+    if region is None:
+        session = boto3.Session()
+        region = session.region_name
+        if region is None:
+            print("Error: No AWS region specified. Set AWS_DEFAULT_REGION, configure a profile, or use --region", file=sys.stderr)
+            sys.exit(1)
+    
     # Generate function name if not provided
     if args.function_name:
         function_name = args.function_name
@@ -181,7 +190,7 @@ def main():
         # Build deployment package with embedded runner (no cloudpickle!)
         print(f"[cloud_run] Script: {script_path}", file=sys.stderr)
         print(f"[cloud_run] Script type: {script_type}", file=sys.stderr)
-        print(f"[cloud_run] Region: {args.region}", file=sys.stderr)
+        print(f"[cloud_run] Region: {region}", file=sys.stderr)
         print(f"[cloud_run] Function name: {function_name}", file=sys.stderr)
         print("[cloud_run] Building deployment package...", file=sys.stderr)
         handler_code = _build_script_handler(script_type)
@@ -190,7 +199,7 @@ def main():
         
         # Ensure IAM role and Lambda function
         print("[cloud_run] Ensuring IAM role exists...", file=sys.stderr)
-        role_arn = ensure_role("pi-cloud-runner-role", region_name=args.region)
+        role_arn = ensure_role("pi-cloud-runner-role", region_name=region)
         print(f"[cloud_run] Role ARN: {role_arn}", file=sys.stderr)
         
         print(f"[cloud_run] Deploying Lambda function: {function_name}", file=sys.stderr)
@@ -198,7 +207,7 @@ def main():
             function_name=function_name,
             role_arn=role_arn,
             zip_bytes=zip_bytes,
-            region_name=args.region,
+            region_name=region,
             runtime="python3.12",
             timeout=900,
             memory_size=512,
@@ -206,7 +215,7 @@ def main():
         print("[cloud_run] Lambda function deployed", file=sys.stderr)
         
         # Invoke Lambda with script content as plain JSON (no cloudpickle!)
-        lambda_client = boto3.client("lambda", region_name=args.region)
+        lambda_client = boto3.client("lambda", region_name=region)
         
         # Wait for function to be ready
         print("[cloud_run] Waiting for function to be ready...", file=sys.stderr)
