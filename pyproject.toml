@@ -22,3 +22,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cloud_run"]
+
+[project.scripts]
+cloud_run = "cloud_run.cli:main"
