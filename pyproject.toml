@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.40.21",
     "cloudpickle>=3.0.0",
+    "pydantic>=2.0.0",
 ]
 
 [build-system]
@@ -25,3 +26,8 @@ packages = ["src/cloud_run"]
 
 [project.scripts]
 cloud_run = "cloud_run.cli:main"
+
+[tool.ruff]
+line-length = 100
+preview = true
+
