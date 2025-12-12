@@ -65,7 +65,14 @@ def main():
         action="append",
         dest="secrets",
         metavar="SECRET_NAME",
-        help="Secrets Manager secret name/ARN. All key-value pairs from the secret JSON will be injected as env vars.",
+        help="Secrets Manager secret name/ARN. All key-value pairs from the secret JSON will be injected as env vars (passed via container overrides, counts toward 8KB limit).",
+    )
+    parser.add_argument(
+        "--runtime-secret",
+        action="append",
+        dest="runtime_secrets",
+        metavar="SECRET_NAME",
+        help="Like --secret, but fetched inside the container at runtime (requires boto3 in container, avoids 8KB override limit).",
     )
     parser.add_argument("--function-name", help="Lambda function name (default: auto-generated)")
     parser.add_argument(
@@ -205,6 +212,7 @@ def main():
             args.create_cluster,
             env_vars,
             secrets,
+            args.runtime_secrets,
         )
     else:
         function_name = args.function_name or f"cloud-run-script-{script_type}"

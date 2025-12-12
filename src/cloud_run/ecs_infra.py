@@ -273,6 +273,7 @@ def run_ecs_task(
     script_args: Optional[list[str]] = None,
     env_vars: Optional[dict[str, str]] = None,
     secrets: Optional[list[str]] = None,
+    runtime_secrets: Optional[list[str]] = None,
     container_name: str = "script-runner",
     security_group_ids: Optional[list[str]] = None,
     region_name: Optional[str] = None,
@@ -316,12 +317,21 @@ def run_ecs_task(
     # Show script size info
     print(f"[cloud_run] Script size after compression: {len(script_b64)} bytes", file=sys.stderr)
 
+    # Build secret-fetching code if runtime_secrets specified
+    # This fetches secrets inside the container using boto3, avoiding the 8KB override limit
+    secrets_loader = ""
+    if runtime_secrets:
+        secrets_json = json.dumps(runtime_secrets)
+        # Compact single-line Python using list comprehension and exec
+        # Fetches each secret, parses JSON, exports all keys as env vars
+        secrets_loader = f"import boto3,os;_sm=boto3.client('secretsmanager');[os.environ.update({{str(k):str(v) for k,v in json.loads(_sm.get_secret_value(SecretId=s).get('SecretString','{{}}')).items()}}) for s in {secrets_json}];"
+
     # Build command that decompresses and executes the script inline
     if script_type == "python":
         command = [
             "python",
             "-c",
-            f"import base64,gzip,sys,json;sys.argv=['script']+json.loads('{args_json}');exec(gzip.decompress(base64.b64decode('{script_b64}')).decode())",
+            f"import base64,gzip,sys,json;{secrets_loader}sys.argv=['script']+json.loads('{args_json}');exec(gzip.decompress(base64.b64decode('{script_b64}')).decode())",
         ]
     else:
         # For bash: use Python subprocess to run bash with the script
@@ -329,7 +339,7 @@ def run_ecs_task(
         command = [
             "python3",
             "-c",
-            f"import base64,gzip,subprocess,sys,json;script=gzip.decompress(base64.b64decode('{script_b64}')).decode();args=json.loads('{args_json}');sys.exit(subprocess.call(['/bin/bash','-c',script,'bash']+args))",
+            f"import base64,gzip,subprocess,sys,json;{secrets_loader}script=gzip.decompress(base64.b64decode('{script_b64}')).decode();args=json.loads('{args_json}');sys.exit(subprocess.call(['/bin/bash','-c',script,'bash']+args))",
         ]
 
     # Build network configuration
@@ -368,6 +378,41 @@ def run_ecs_task(
     # Add environment variables if provided
     if all_env_vars:
         container_override["environment"] = [{"name": k, "value": v} for k, v in all_env_vars.items()]
+
+    # Check container overrides size before calling API
+    overrides = {"containerOverrides": [container_override]}
+    overrides_json = json.dumps(overrides)
+    overrides_size = len(overrides_json)
+    
+    ECS_OVERRIDES_LIMIT = 8192
+    if overrides_size > ECS_OVERRIDES_LIMIT:
+        # Calculate breakdown for helpful error message
+        command_size = len(json.dumps(container_override.get("command", [])))
+        env_size = len(json.dumps(container_override.get("environment", [])))
+        env_count = len(all_env_vars) if all_env_vars else 0
+        
+        error_msg = (
+            f"Container overrides exceed ECS limit of {ECS_OVERRIDES_LIMIT} bytes.\n"
+            f"  Total size: {overrides_size} bytes (limit: {ECS_OVERRIDES_LIMIT})\n"
+            f"  - Command (script + args): {command_size} bytes\n"
+            f"  - Environment variables ({env_count}): {env_size} bytes\n"
+        )
+        
+        if env_size > command_size:
+            error_msg += (
+                "\nThe environment variables are the main contributor. Consider:\n"
+                "  1. Using fewer secrets or smaller secret values\n"
+                "  2. Configuring secrets in the task definition instead of runtime overrides\n"
+                "  3. Using AWS Secrets Manager references in the task definition"
+            )
+        else:
+            error_msg += (
+                "\nThe script is the main contributor. Consider:\n"
+                "  1. Reducing script size\n"
+                "  2. Moving logic to a pre-built container image"
+            )
+        
+        raise RuntimeError(error_msg)
 
     response = ecs.run_task(
         cluster=cluster_arn,

@@ -1001,6 +1001,7 @@ def run_on_ecs(
     create_cluster: bool = False,
     env_vars: Optional[dict[str, str]] = None,
     secrets: Optional[list[str]] = None,
+    runtime_secrets: Optional[list[str]] = None,
 ) -> None:
     """Run script on ECS Fargate."""
     if not cluster:
@@ -1057,6 +1058,8 @@ def run_on_ecs(
             print(f"[cloud_run] Environment variables: {list(env_vars.keys())}", file=sys.stderr)
         if secrets:
             print(f"[cloud_run] Secrets: {secrets}", file=sys.stderr)
+        if runtime_secrets:
+            print(f"[cloud_run] Runtime secrets (fetched in container): {runtime_secrets}", file=sys.stderr)
         task_start = time.time()
         task_arn = run_ecs_task(
             cluster_arn=config.cluster_arn,
@@ -1068,6 +1071,7 @@ def run_on_ecs(
             script_args=script_args,
             env_vars=env_vars,
             secrets=secrets,
+            runtime_secrets=runtime_secrets,
             container_name=config.container_name,
             region_name=region,
         )
