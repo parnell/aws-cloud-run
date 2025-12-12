@@ -386,33 +386,35 @@ def run_ecs_task(
     
     ECS_OVERRIDES_LIMIT = 8192
     if overrides_size > ECS_OVERRIDES_LIMIT:
-        # Calculate breakdown for helpful error message
+        # Calculate breakdown for helpful warning message
         command_size = len(json.dumps(container_override.get("command", [])))
         env_size = len(json.dumps(container_override.get("environment", [])))
         env_count = len(all_env_vars) if all_env_vars else 0
         
-        error_msg = (
-            f"Container overrides exceed ECS limit of {ECS_OVERRIDES_LIMIT} bytes.\n"
+        print(
+            f"[cloud_run] WARNING: Container overrides exceed ECS limit of {ECS_OVERRIDES_LIMIT} bytes.\n"
             f"  Total size: {overrides_size} bytes (limit: {ECS_OVERRIDES_LIMIT})\n"
             f"  - Command (script + args): {command_size} bytes\n"
-            f"  - Environment variables ({env_count}): {env_size} bytes\n"
+            f"  - Environment variables ({env_count}): {env_size} bytes",
+            file=sys.stderr,
         )
         
         if env_size > command_size:
-            error_msg += (
+            print(
                 "\nThe environment variables are the main contributor. Consider:\n"
-                "  1. Using fewer secrets or smaller secret values\n"
-                "  2. Configuring secrets in the task definition instead of runtime overrides\n"
-                "  3. Using AWS Secrets Manager references in the task definition"
+                "  1. Using --runtime-secret instead of --secret (fetches secrets inside the container)\n"
+                "  2. Configuring secrets in the task definition instead of runtime overrides",
+                file=sys.stderr,
             )
         else:
-            error_msg += (
+            print(
                 "\nThe script is the main contributor. Consider:\n"
                 "  1. Reducing script size\n"
-                "  2. Moving logic to a pre-built container image"
+                "  2. Moving logic to a pre-built container image",
+                file=sys.stderr,
             )
         
-        raise RuntimeError(error_msg)
+        print("[cloud_run] Attempting to run anyway...", file=sys.stderr)
 
     response = ecs.run_task(
         cluster=cluster_arn,
