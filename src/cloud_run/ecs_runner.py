@@ -1,5 +1,7 @@
 """ECS Fargate execution utilities for cloud_run."""
 
+import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -318,27 +320,39 @@ def list_ecs_tasks(region: str) -> None:
         print(f"Total: {total_tasks} tasks shown across {len(clusters)} cluster(s)")
 
 
-def list_task_definitions(region: str) -> None:
-    """List available ECS task definitions."""
+def list_task_definitions(region: str, prefix: Optional[str] = None) -> None:
+    """List available ECS task definitions, optionally filtered by prefix."""
     ecs = boto3.client("ecs", region_name=region)
 
     try:
         # List task definition families
         families = []
         paginator = ecs.get_paginator("list_task_definition_families")
-        for page in paginator.paginate(status="ACTIVE"):
+        # Use familyPrefix if provided
+        paginate_kwargs = {"status": "ACTIVE"}
+        if prefix:
+            paginate_kwargs["familyPrefix"] = prefix
+        for page in paginator.paginate(**paginate_kwargs):
             families.extend(page.get("families", []))
     except Exception as e:
         print(f"Error listing task definitions: {e}", file=sys.stderr)
         return
 
     if not families:
-        print(f"No task definitions found in {region}")
+        if prefix:
+            print(f"No task definitions found matching '{prefix}*' in {region}")
+        else:
+            print(f"No task definitions found in {region}")
         return
 
-    print(f"ECS Task Definitions in {region}:\n")
-    print(f"{'Family':<40} {'Latest':<10} {'CPU':<8} {'Memory':<8} {'Image'}")
-    print("-" * 100)
+    # Header
+    if prefix:
+        print(f"\nECS Task Definitions matching '{prefix}*' in {region}:\n")
+    else:
+        print(f"\nECS Task Definitions in {region}:\n")
+    
+    print(f"{'Family':<50} {'Rev':<6} {'CPU':<6} {'Mem':<6} {'Containers':<12} {'Image'}")
+    print("-" * 120)
 
     for family in sorted(families):
         try:
@@ -346,23 +360,34 @@ def list_task_definitions(region: str) -> None:
             response = ecs.describe_task_definition(taskDefinition=family)
             task_def = response.get("taskDefinition", {})
 
-            revision = task_def.get("revision", "-")
+            revision = str(task_def.get("revision", "-"))
             cpu = task_def.get("cpu", "-")
             memory = task_def.get("memory", "-")
 
-            # Get image from first container
+            # Get container info
             containers = task_def.get("containerDefinitions", [])
+            container_count = str(len(containers))
             image = containers[0].get("image", "-") if containers else "-"
+            
             # Truncate long image names
-            if len(image) > 40:
-                image = "..." + image[-37:]
+            if len(image) > 35:
+                image = "..." + image[-32:]
+            
+            # Color code based on container count
+            if len(containers) == 1:
+                status = f"{Colors.GREEN}✓{Colors.RESET}"
+            else:
+                status = f"{Colors.YELLOW}⚠{Colors.RESET}"
 
-            print(f"{family:<40} {revision:<10} {cpu:<8} {memory:<8} {image}")
+            print(f"{status} {family:<48} {revision:<6} {cpu:<6} {memory:<6} {container_count:<12} {image}")
         except Exception:
-            print(f"{family:<40} (error fetching details)")
+            print(f"  {family:<48} (error fetching details)")
 
     print(f"\nTotal: {len(families)} task definition families")
-    print("\nUsage: cloud_run script.py --ecs --task-definition <family>:<revision>")
+    if prefix:
+        print("\nUsage: cloud_run script.py --ecs --cluster <cluster> --task-definition <family>")
+    else:
+        print("\nTip: Use --list-task-definitions <prefix> to filter (e.g., --list-task-definitions scaffold-dev-)")
 
 
 def _get_cluster_arn(ecs, cluster_name: str) -> Optional[str]:
@@ -377,6 +402,343 @@ def _get_cluster_arn(ecs, cluster_name: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _parse_ecr_image_uri(image_uri: str) -> Optional[dict]:
+    """Parse an ECR image URI into its components.
+    
+    Returns dict with registry, repository, tag/digest, or None if not an ECR image.
+    """
+    # ECR format: <account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
+    # or: <account>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:<digest>
+    ecr_pattern = r'^(\d+)\.dkr\.ecr\.([^.]+)\.amazonaws\.com/([^:@]+)(?::([^@]+)|@(.+))?$'
+    match = re.match(ecr_pattern, image_uri)
+    
+    if not match:
+        return None
+    
+    return {
+        "account": match.group(1),
+        "region": match.group(2),
+        "repository": match.group(3),
+        "tag": match.group(4) or "latest",
+        "digest": match.group(5),
+    }
+
+
+def _get_image_entrypoint(image_uri: str, region: str) -> Optional[dict]:
+    """Get the ENTRYPOINT from a Docker image in ECR.
+    
+    Returns dict with:
+        - entrypoint: list or None
+        - cmd: list or None  
+        - safe: bool (True if entrypoint is safe for command override)
+        - reason: str (explanation)
+    
+    Returns None if unable to inspect (non-ECR image, access denied, etc.)
+    """
+    parsed = _parse_ecr_image_uri(image_uri)
+    if not parsed:
+        # Not an ECR image (e.g., python:3.11 from Docker Hub)
+        # We can't inspect it, but public images are usually safe
+        return {
+            "entrypoint": None,
+            "cmd": None,
+            "safe": True,
+            "reason": "public image (cannot inspect, assuming safe)",
+        }
+    
+    try:
+        # Use the region from the image URI, not the task region
+        ecr = boto3.client("ecr", region_name=parsed["region"])
+        
+        # Get the image manifest
+        image_id = {"imageTag": parsed["tag"]} if parsed["tag"] else {"imageDigest": parsed["digest"]}
+        
+        response = ecr.batch_get_image(
+            repositoryName=parsed["repository"],
+            imageIds=[image_id],
+            acceptedMediaTypes=["application/vnd.docker.distribution.manifest.v2+json"],
+        )
+        
+        if not response.get("images"):
+            return None
+        
+        manifest = json.loads(response["images"][0]["imageManifest"])
+        config_digest = manifest.get("config", {}).get("digest")
+        
+        if not config_digest:
+            return None
+        
+        # Get the image config blob
+        blob_response = ecr.get_download_url_for_layer(
+            repositoryName=parsed["repository"],
+            layerDigest=config_digest,
+        )
+        
+        # Download the config
+        import urllib.request
+        with urllib.request.urlopen(blob_response["downloadUrl"]) as resp:
+            config = json.loads(resp.read().decode())
+        
+        # Extract entrypoint and cmd from config
+        container_config = config.get("config", {})
+        entrypoint = container_config.get("Entrypoint")
+        cmd = container_config.get("Cmd")
+        
+        # Determine if it's safe for command override
+        safe = True
+        reason = ""
+        
+        if not entrypoint:
+            safe = True
+            reason = "no entrypoint"
+        elif entrypoint in [["python"], ["python3"], ["/bin/sh", "-c"], ["/bin/bash", "-c"]]:
+            safe = True
+            reason = f"shell-style entrypoint: {entrypoint}"
+        else:
+            # Unknown entrypoint - could be safe if it uses exec "$@", but we can't tell
+            safe = False
+            reason = f"custom entrypoint: {entrypoint}"
+        
+        return {
+            "entrypoint": entrypoint,
+            "cmd": cmd,
+            "safe": safe,
+            "reason": reason,
+        }
+        
+    except Exception as e:
+        # Can't inspect - might be access denied, image doesn't exist, etc.
+        return {
+            "entrypoint": None,
+            "cmd": None,
+            "safe": None,  # Unknown
+            "reason": f"could not inspect: {e}",
+        }
+
+
+def _list_cluster_task_definitions(ecs, cluster_arn: str, region: str) -> list[dict]:
+    """List all unique task definitions from a cluster with their status and warnings.
+    
+    Returns list of dicts with:
+        - family: task definition family name
+        - task_def_arn: full ARN
+        - status: 'running' or 'stopped'
+        - service: service name if started by a service
+        - containers: list of container names
+        - container_count: number of containers
+        - image: image URI (of first container)
+        - warnings: list of warning strings
+        - usable: True if safe to use without issues
+    """
+    try:
+        # Get running and stopped tasks
+        running = ecs.list_tasks(cluster=cluster_arn, desiredStatus="RUNNING", maxResults=20)
+        stopped = ecs.list_tasks(cluster=cluster_arn, desiredStatus="STOPPED", maxResults=20)
+        
+        all_task_arns = running.get("taskArns", []) + stopped.get("taskArns", [])
+        
+        if not all_task_arns:
+            return []
+        
+        # Get task details
+        tasks_response = ecs.describe_tasks(cluster=cluster_arn, tasks=all_task_arns)
+        tasks = tasks_response.get("tasks", [])
+        
+        # Group by task definition family and get unique ones
+        seen_families = {}
+        
+        for task in tasks:
+            task_def_arn = task.get("taskDefinitionArn")
+            if not task_def_arn:
+                continue
+            
+            # Extract family from ARN
+            family = task_def_arn.split("/")[-1].rsplit(":", 1)[0]
+            
+            # Keep the most recent/relevant task for each family
+            if family in seen_families:
+                # Prefer running over stopped
+                existing = seen_families[family]
+                if existing["status"] == "running":
+                    continue
+            
+            status = "running" if task.get("lastStatus") == "RUNNING" else "stopped"
+            started_by = task.get("startedBy", "")
+            service = None
+            if started_by.startswith("ecs-svc/"):
+                # Extract service name from group
+                group = task.get("group", "")
+                if group.startswith("service:"):
+                    service = group[8:]
+            
+            seen_families[family] = {
+                "task_def_arn": task_def_arn,
+                "status": status,
+                "service": service,
+                "created_at": task.get("createdAt"),
+            }
+        
+        # Now get full task definition details for each unique family
+        results = []
+        
+        for family, task_info in seen_families.items():
+            try:
+                response = ecs.describe_task_definition(taskDefinition=task_info["task_def_arn"])
+            except Exception:
+                continue
+            
+            task_def = response.get("taskDefinition", {})
+            containers = task_def.get("containerDefinitions", [])
+            
+            if not containers:
+                continue
+            
+            container_names = [c.get("name", "?") for c in containers]
+            first_container = containers[0]
+            image = first_container.get("image", "")
+            
+            # Analyze warnings
+            warnings = []
+            usable = True
+            
+            # Check for multiple containers
+            if len(containers) > 1:
+                warnings.append(f"Has {len(containers)} containers (sidecars will also run): {container_names}")
+                usable = False
+            
+            # Check for entrypoint override in task def
+            entrypoint = first_container.get("entryPoint")
+            if entrypoint:
+                warnings.append(f"Has custom entryPoint: {entrypoint}")
+                usable = False
+            
+            # Check image entrypoint
+            if image:
+                image_info = _get_image_entrypoint(image, region)
+                if image_info and image_info.get("safe") is False:
+                    warnings.append(f"Image {image_info.get('reason')}")
+                    usable = False
+            
+            # Extract log group
+            log_config = first_container.get("logConfiguration", {})
+            log_group = None
+            if log_config.get("logDriver") == "awslogs":
+                log_group = log_config.get("options", {}).get("awslogs-group")
+            if not log_group:
+                log_group = f"/ecs/{family}"
+            
+            results.append({
+                "family": family,
+                "task_def_arn": task_info["task_def_arn"],
+                "status": task_info["status"],
+                "service": task_info["service"],
+                "created_at": task_info["created_at"],
+                "containers": container_names,
+                "container_count": len(containers),
+                "container_name": container_names[0],
+                "image": image,
+                "log_group": log_group,
+                "warnings": warnings,
+                "usable": usable,
+            })
+        
+        # Sort: usable first, then running, then by name
+        results.sort(key=lambda x: (not x["usable"], x["status"] != "running", x["family"]))
+        
+        return results
+    except Exception:
+        return []
+
+
+def _human_readable_time(dt) -> str:
+    """Convert a datetime to human-readable relative time."""
+    from datetime import datetime, timezone
+    
+    if dt is None:
+        return "unknown"
+    
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    
+    diff = now - dt
+    seconds = diff.total_seconds()
+    
+    if seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        mins = int(seconds / 60)
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    elif seconds < 604800:
+        days = int(seconds / 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    else:
+        return dt.strftime("%Y-%m-%d")
+
+
+# ANSI color codes
+class Colors:
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    CYAN = "\033[36m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def _print_cluster_task_definitions(task_defs: list[dict], cluster_name: str) -> None:
+    """Print a formatted list of task definitions from a cluster."""
+    print(f"\n[cloud_run] Task definitions in cluster '{cluster_name}':\n", file=sys.stderr)
+
+    if not task_defs:
+        print("  (no task definitions found)\n", file=sys.stderr)
+        return
+
+    for td in task_defs:
+        # Color-coded status
+        if td["usable"]:
+            icon = f"{Colors.GREEN}✓{Colors.RESET}"
+            name_color = Colors.GREEN
+        else:
+            icon = f"{Colors.YELLOW}⚠{Colors.RESET}"
+            name_color = Colors.YELLOW
+        
+        # Status string with color
+        if td["status"] == "running":
+            status_str = f"{Colors.GREEN}[running]{Colors.RESET}"
+        else:
+            status_str = f"{Colors.DIM}[stopped]{Colors.RESET}"
+        
+        if td["service"]:
+            status_str += f" {Colors.CYAN}service:{td['service']}{Colors.RESET}"
+
+        print(f"  {icon} {name_color}{td['family']}{Colors.RESET} {status_str}", file=sys.stderr)
+
+        # Show last used time
+        last_used = _human_readable_time(td.get("created_at"))
+        print(f"      Last used: {last_used}", file=sys.stderr)
+
+        # Show image (truncated)
+        image = td["image"]
+        if len(image) > 60:
+            image = "..." + image[-57:]
+        print(f"      {Colors.DIM}Image: {image}{Colors.RESET}", file=sys.stderr)
+
+        # Show container info
+        if td["container_count"] > 1:
+            print(f"      Containers: {', '.join(td['containers'])}", file=sys.stderr)
+
+        # Show warnings
+        for warning in td["warnings"]:
+            print(f"      {Colors.YELLOW}⚠ {warning}{Colors.RESET}", file=sys.stderr)
+
+        print("", file=sys.stderr)
 
 
 def _get_network_from_cluster(ecs, cluster_arn: str) -> Optional[dict]:
@@ -492,31 +854,92 @@ def _resolve_ecs_config(
             response = ecs.describe_task_definition(taskDefinition=task_definition)
             task_def_info = response.get("taskDefinition", {})
             containers = task_def_info.get("containerDefinitions", [])
-            
+
             if not containers:
                 raise RuntimeError("Task definition has no containers")
-            
+
             config.task_def_arn = task_def_info.get("taskDefinitionArn")
             config.task_family = task_def_info.get("family", "unknown")
             config.container_name = containers[0].get("name")
-            
+
             # Extract log group
             log_config = containers[0].get("logConfiguration", {})
             if log_config.get("logDriver") == "awslogs":
                 config.log_group = log_config.get("options", {}).get("awslogs-group")
             if not config.log_group:
                 config.log_group = f"/ecs/{config.task_family}"
-            
+
             print(f"[cloud_run]   Task definition: {task_definition} ✓", file=sys.stderr)
             print(f"[cloud_run]   Container: {config.container_name}", file=sys.stderr)
+            
+            # Check for potential issues and warn (but proceed since user specified explicitly)
+            warnings = []
+            
+            # Check for multiple containers (sidecars)
+            if len(containers) > 1:
+                container_names = [c.get("name", "?") for c in containers]
+                warnings.append(f"Has {len(containers)} containers: {container_names}")
+                warnings.append("Only the first container's command will be overridden")
+                warnings.append("Other containers (sidecars) will run with their default commands")
+            
+            # Check for entrypoint override in task def
+            entrypoint = containers[0].get("entryPoint")
+            if entrypoint:
+                warnings.append(f"Has custom entryPoint: {entrypoint}")
+                warnings.append("ECS doesn't allow overriding entryPoint - your script will run AFTER it")
+            
+            # Check image entrypoint
+            image = containers[0].get("image", "")
+            if image:
+                image_info = _get_image_entrypoint(image, region)
+                if image_info and image_info.get("safe") is False:
+                    warnings.append(f"Image {image_info.get('reason')}")
+                    warnings.append("ECS doesn't allow overriding entryPoint - your script may not run correctly")
+            
+            if warnings:
+                print("[cloud_run]   ⚠ Warnings:", file=sys.stderr)
+                for w in warnings:
+                    print(f"[cloud_run]     - {w}", file=sys.stderr)
+                print("[cloud_run]   Proceeding anyway (--task-definition was explicit)", file=sys.stderr)
+                
         except ecs.exceptions.ClientException as e:
             raise RuntimeError(f"Task definition '{task_definition}' not found: {e}")
     else:
-        config.task_family = f"cloud-run-task-{script_type}"
-        config.container_name = "script-runner"
-        config.log_group = f"/ecs/{config.task_family}"
-        print(f"[cloud_run]   Task definition: {config.task_family} (will create)", file=sys.stderr)
-        print(f"[cloud_run]   CPU: {cpu}, Memory: {memory}MB", file=sys.stderr)
+        # No task definition specified - list available ones and ask user to choose
+        if cluster_arn:
+            task_defs = _list_cluster_task_definitions(ecs, cluster_arn, region)
+            
+            if task_defs:
+                _print_cluster_task_definitions(task_defs, cluster_name)
+                
+                # Build suggested command
+                usable = [td for td in task_defs if td["usable"]]
+                if usable:
+                    suggested = usable[0]["family"]
+                    print("[cloud_run] To run with a task definition:", file=sys.stderr)
+                    print(f"  cloud_run <script> --ecs --cluster {cluster_name} --task-definition {suggested}\n", file=sys.stderr)
+                else:
+                    print("[cloud_run] No task definitions without warnings found.", file=sys.stderr)
+                    print("  You can still use one with --task-definition (warnings will be shown).", file=sys.stderr)
+                    print("  Or omit --cluster to let cloud_run create a new task definition.\n", file=sys.stderr)
+
+                # Exit cleanly - this is an expected flow, not an error
+                sys.exit(0)
+            else:
+                # No task definitions found in cluster - will create new one
+                config.task_family = f"cloud-run-task-{script_type}"
+                config.container_name = "script-runner"
+                config.log_group = f"/ecs/{config.task_family}"
+                print("[cloud_run]   No existing task definitions in cluster", file=sys.stderr)
+                print(f"[cloud_run]   Task definition: {config.task_family} (will create)", file=sys.stderr)
+                print(f"[cloud_run]   CPU: {cpu}, Memory: {memory}MB", file=sys.stderr)
+        else:
+            # No cluster yet - will create new task definition
+            config.task_family = f"cloud-run-task-{script_type}"
+            config.container_name = "script-runner"
+            config.log_group = f"/ecs/{config.task_family}"
+            print(f"[cloud_run]   Task definition: {config.task_family} (will create)", file=sys.stderr)
+            print(f"[cloud_run]   CPU: {cpu}, Memory: {memory}MB", file=sys.stderr)
     
     # 3. Resolve network configuration (subnets and security groups)
     resolved_subnets: Optional[list[str]] = None
@@ -576,6 +999,8 @@ def run_on_ecs(
     subnet_ids: Optional[list[str]] = None,
     security_group_ids: Optional[list[str]] = None,
     create_cluster: bool = False,
+    env_vars: Optional[dict[str, str]] = None,
+    secrets: Optional[list[str]] = None,
 ) -> None:
     """Run script on ECS Fargate."""
     if not cluster:
@@ -626,6 +1051,12 @@ def run_on_ecs(
         
         # Phase 3: Run the task
         print("[cloud_run] Starting ECS task...", file=sys.stderr)
+        if script_args:
+            print(f"[cloud_run] Script arguments: {script_args}", file=sys.stderr)
+        if env_vars:
+            print(f"[cloud_run] Environment variables: {list(env_vars.keys())}", file=sys.stderr)
+        if secrets:
+            print(f"[cloud_run] Secrets: {secrets}", file=sys.stderr)
         task_start = time.time()
         task_arn = run_ecs_task(
             cluster_arn=config.cluster_arn,
@@ -634,6 +1065,9 @@ def run_on_ecs(
             security_group_ids=config.security_group_ids,
             script_content=script_content,
             script_type=script_type,
+            script_args=script_args,
+            env_vars=env_vars,
+            secrets=secrets,
             container_name=config.container_name,
             region_name=region,
         )

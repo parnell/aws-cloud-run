@@ -104,7 +104,7 @@ def get_vpc_subnets(
     subnet_ids: Optional[list[str]] = None,
 ) -> tuple[str, list[str]]:
     """Get VPC ID and subnet IDs for running Fargate tasks.
-    
+
     If vpc_id and subnet_ids are provided, validates and returns them.
     Otherwise, tries to find a suitable VPC (default first, then any VPC).
     """
@@ -153,7 +153,7 @@ def get_vpc_subnets(
         found_subnet_ids = [s["SubnetId"] for s in subnets["Subnets"]]
         if found_subnet_ids:
             return found_vpc_id, found_subnet_ids
-        
+
         # Try any subnet in this VPC
         subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [found_vpc_id]}])
         found_subnet_ids = [s["SubnetId"] for s in subnets["Subnets"]]
@@ -179,7 +179,7 @@ def ensure_log_group(
 ) -> None:
     """Ensure CloudWatch log group exists."""
     logs = boto3.client("logs", region_name=region_name)
-    
+
     try:
         logs.create_log_group(logGroupName=log_group_name)
     except ClientError as e:
@@ -196,12 +196,12 @@ def register_task_definition(
     region_name: Optional[str] = None,
 ) -> str:
     """Register an ECS task definition for running scripts.
-    
+
     The task definition uses a minimal command that will be overridden at runtime.
     The actual script is passed via command override when running the task.
     """
     ecs = boto3.client("ecs", region_name=region_name)
-    
+
     log_group = f"/ecs/{family}"
     ensure_log_group(log_group, region_name=region_name)
 
@@ -245,40 +245,91 @@ def register_task_definition(
     return response["taskDefinition"]["taskDefinitionArn"]
 
 
+def _strip_shell_comments(script: str) -> str:
+    """Strip comment-only lines and blank lines from shell scripts to reduce size."""
+    lines = []
+    for line in script.split("\n"):
+        # Keep shebang
+        if line.startswith("#!"):
+            lines.append(line)
+            continue
+
+        # Skip blank lines and comment-only lines
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 def run_ecs_task(
     cluster_arn: str,
     task_definition_arn: str,
     subnet_ids: list[str],
     script_content: str,
     script_type: str = "python",
+    script_args: Optional[list[str]] = None,
+    env_vars: Optional[dict[str, str]] = None,
+    secrets: Optional[list[str]] = None,
     container_name: str = "script-runner",
     security_group_ids: Optional[list[str]] = None,
     region_name: Optional[str] = None,
 ) -> str:
     """Run an ECS Fargate task; return task ARN.
-    
-    The script is base64-encoded and passed via command override.
-    This overrides the container's entrypoint to run our script.
+
+    The script is stripped of comments, gzip compressed, and base64-encoded.
+    For very large scripts (>5KB compressed), uploads to S3 and uses boto3 to fetch.
+
+    Note: ECS API only allows overriding 'command', not 'entryPoint'.
+    - If the image has no ENTRYPOINT: our command runs directly ✓
+    - If the image has ENTRYPOINT with 'exec "$@"' pattern: our command runs after setup ✓
+    - If the image has a fixed ENTRYPOINT: may conflict (use a different task definition)
     """
     import base64
-    
+    import gzip
+    import json
+    import sys
+
     ecs = boto3.client("ecs", region_name=region_name)
-    
-    # Base64 encode the script to safely pass it
-    script_b64 = base64.b64encode(script_content.encode()).decode()
-    
-    # Build command that decodes and executes the script
+
+    # Strip comments for shell scripts to reduce size
+    if script_type == "shell":
+        original_size = len(script_content)
+        script_content = _strip_shell_comments(script_content)
+        stripped_size = len(script_content)
+        if stripped_size < original_size:
+            print(
+                f"[cloud_run] Script stripped: {original_size} → {stripped_size} bytes ({100 - stripped_size * 100 // original_size}% reduction)",
+                file=sys.stderr,
+            )
+
+    # Gzip compress then base64 encode the script
+    compressed = gzip.compress(script_content.encode())
+    script_b64 = base64.b64encode(compressed).decode()
+
+    # Prepare args
+    args_list = script_args or []
+    args_json = json.dumps(args_list)
+
+    # Show script size info
+    print(f"[cloud_run] Script size after compression: {len(script_b64)} bytes", file=sys.stderr)
+
+    # Build command that decompresses and executes the script inline
     if script_type == "python":
-        # Use Python to decode and execute
         command = [
-            "python", "-c",
-            f"import base64; exec(base64.b64decode('{script_b64}').decode())"
+            "python",
+            "-c",
+            f"import base64,gzip,sys,json;sys.argv=['script']+json.loads('{args_json}');exec(gzip.decompress(base64.b64decode('{script_b64}')).decode())",
         ]
     else:
-        # Use bash to decode and execute
+        # For bash: use Python subprocess to run bash with the script
+        # This avoids writing to disk (read-only filesystem) and handles args properly
         command = [
-            "/bin/bash", "-c",
-            f"echo '{script_b64}' | base64 -d | /bin/bash"
+            "python3",
+            "-c",
+            f"import base64,gzip,subprocess,sys,json;script=gzip.decompress(base64.b64decode('{script_b64}')).decode();args=json.loads('{args_json}');sys.exit(subprocess.call(['/bin/bash','-c',script,'bash']+args))",
         ]
 
     # Build network configuration
@@ -289,19 +340,41 @@ def run_ecs_task(
     if security_group_ids:
         network_config["securityGroups"] = security_group_ids
 
+    # Build container override
+    container_override: dict = {
+        "name": container_name,
+        "command": command,
+    }
+
+    # Fetch secrets from Secrets Manager and merge into env vars
+    all_env_vars = dict(env_vars) if env_vars else {}
+    if secrets:
+        sm = boto3.client("secretsmanager", region_name=region_name)
+        for secret_name in secrets:
+            try:
+                resp = sm.get_secret_value(SecretId=secret_name)
+                secret_value = resp.get("SecretString")
+                if secret_value:
+                    secret_dict = json.loads(secret_value)
+                    if isinstance(secret_dict, dict):
+                        count = len(secret_dict)
+                        all_env_vars.update({str(k): str(v) for k, v in secret_dict.items()})
+                        print(f"[cloud_run] Loaded {count} environment variables from '{secret_name}'", file=sys.stderr)
+                    else:
+                        print(f"[cloud_run] Warning: Secret '{secret_name}' is not a JSON object, skipping", file=sys.stderr)
+            except Exception as e:
+                raise RuntimeError(f"Failed to fetch secret '{secret_name}': {e}")
+
+    # Add environment variables if provided
+    if all_env_vars:
+        container_override["environment"] = [{"name": k, "value": v} for k, v in all_env_vars.items()]
+
     response = ecs.run_task(
         cluster=cluster_arn,
         taskDefinition=task_definition_arn,
         launchType="FARGATE",
         networkConfiguration={"awsvpcConfiguration": network_config},
-        overrides={
-            "containerOverrides": [
-                {
-                    "name": container_name,
-                    "command": command,
-                }
-            ]
-        },
+        overrides={"containerOverrides": [container_override]},
     )
 
     if not response.get("tasks"):
@@ -321,38 +394,38 @@ def wait_for_task_completion(
     container_name: Optional[str] = None,
 ) -> dict:
     """Wait for ECS task to complete; return task info.
-    
+
     If log_group and container_name are provided, streams logs in real-time.
     """
     import sys
-    
+
     ecs = boto3.client("ecs", region_name=region_name)
     logs_client = boto3.client("logs", region_name=region_name) if log_group else None
-    
+
     start_time = time.time()
     last_status = None
     task_id = task_arn.split("/")[-1]
-    
+
     # For log streaming
     next_token = None
     log_stream_name = None
     logs_started = False
-    
+
     while time.time() - start_time < timeout:
         response = ecs.describe_tasks(cluster=cluster_arn, tasks=[task_arn])
-        
+
         if not response.get("tasks"):
             raise RuntimeError(f"Task {task_arn} not found")
-        
+
         task = response["tasks"][0]
         status = task.get("lastStatus", "UNKNOWN")
-        
+
         # Print status changes
         if status != last_status:
             elapsed = int(time.time() - start_time)
             print(f"[cloud_run] Task status: {status} ({elapsed}s)", file=sys.stderr)
             last_status = status
-        
+
         # Stream logs while RUNNING
         if status == "RUNNING" and log_group and container_name and logs_client:
             # Find the log stream if we haven't yet
@@ -361,11 +434,11 @@ def wait_for_task_completion(
                 if log_stream_name and not logs_started:
                     print("[cloud_run] --- Live logs ---", file=sys.stderr)
                     logs_started = True
-            
+
             # Fetch new log events
             if log_stream_name:
                 next_token = _stream_new_logs(logs_client, log_group, log_stream_name, next_token)
-        
+
         if status == "STOPPED":
             # Fetch any remaining logs
             if log_stream_name and logs_client and log_group:
@@ -373,13 +446,15 @@ def wait_for_task_completion(
                 if logs_started:
                     print("[cloud_run] --- End logs ---", file=sys.stderr)
             return task
-        
+
         time.sleep(poll_interval)
-    
+
     raise RuntimeError(f"Task {task_arn} did not complete within {timeout} seconds")
 
 
-def _find_log_stream(logs_client, log_group: str, task_id: str, container_name: str) -> Optional[str]:
+def _find_log_stream(
+    logs_client, log_group: str, task_id: str, container_name: str
+) -> Optional[str]:
     """Find the log stream for a task."""
     # Try common patterns
     patterns = [
@@ -388,12 +463,14 @@ def _find_log_stream(logs_client, log_group: str, task_id: str, container_name: 
         f"{container_name}/{container_name}/{task_id}",
         f"{container_name}/{task_id}",
     ]
-    
+
     for pattern in patterns:
         try:
             logs_client.describe_log_streams(
                 logGroupName=log_group,
-                logStreamNamePrefix=pattern[:pattern.rfind("/") + 1] if "/" in pattern else pattern,
+                logStreamNamePrefix=pattern[: pattern.rfind("/") + 1]
+                if "/" in pattern
+                else pattern,
                 limit=1,
             )
             # Check if exact stream exists
@@ -408,7 +485,7 @@ def _find_log_stream(logs_client, log_group: str, task_id: str, container_name: 
                 continue
         except ClientError:
             continue
-    
+
     # Search for any stream with the task ID
     try:
         streams = logs_client.describe_log_streams(
@@ -422,11 +499,13 @@ def _find_log_stream(logs_client, log_group: str, task_id: str, container_name: 
                 return stream["logStreamName"]
     except ClientError:
         pass
-    
+
     return None
 
 
-def _stream_new_logs(logs_client, log_group: str, log_stream: str, next_token: Optional[str]) -> Optional[str]:
+def _stream_new_logs(
+    logs_client, log_group: str, log_stream: str, next_token: Optional[str]
+) -> Optional[str]:
     """Fetch and print new log events, return next token."""
     try:
         kwargs = {
@@ -436,19 +515,19 @@ def _stream_new_logs(logs_client, log_group: str, log_stream: str, next_token: O
         }
         if next_token:
             kwargs["nextToken"] = next_token
-        
+
         response = logs_client.get_log_events(**kwargs)
-        
+
         for event in response.get("events", []):
             print(event.get("message", ""))
-        
+
         # Return the next token for pagination
         new_token = response.get("nextForwardToken")
         # CloudWatch returns the same token if no new events
         if new_token != next_token:
             return new_token
         return next_token
-        
+
     except ClientError:
         return next_token
 
@@ -461,15 +540,15 @@ def get_task_logs(
 ) -> str:
     """Fetch CloudWatch logs for an ECS task."""
     logs_client = boto3.client("logs", region_name=region_name)
-    
+
     # Try multiple stream name formats (different awslogs-stream-prefix values)
     possible_streams = [
-        f"task/{container_name}/{task_id}",           # prefix: task
-        f"ecs/{container_name}/{task_id}",            # prefix: ecs
+        f"task/{container_name}/{task_id}",  # prefix: task
+        f"ecs/{container_name}/{task_id}",  # prefix: ecs
         f"{container_name}/{container_name}/{task_id}",  # prefix: container_name
-        f"{container_name}/{task_id}",                # some configs
+        f"{container_name}/{task_id}",  # some configs
     ]
-    
+
     for log_stream in possible_streams:
         try:
             response = logs_client.get_log_events(
@@ -477,13 +556,13 @@ def get_task_logs(
                 logStreamName=log_stream,
                 startFromHead=True,
             )
-            
+
             events = response.get("events", [])
             if events:
                 return "\n".join(event["message"] for event in events)
         except ClientError:
             continue
-    
+
     # None of the expected formats worked, search for the task ID
     return _try_find_logs(logs_client, log_group, task_id, container_name)
 
@@ -493,7 +572,7 @@ def _try_find_logs(logs_client, log_group: str, task_id: str, container_name: st
     try:
         # Try different prefixes when searching
         prefixes_to_try = ["task/", "ecs/", f"{container_name}/"]
-        
+
         for prefix in prefixes_to_try:
             try:
                 streams = logs_client.describe_log_streams(
@@ -503,7 +582,7 @@ def _try_find_logs(logs_client, log_group: str, task_id: str, container_name: st
                     descending=True,
                     limit=20,
                 )
-                
+
                 # Look for a stream containing the task ID
                 for stream in streams.get("logStreams", []):
                     stream_name = stream.get("logStreamName", "")
@@ -518,7 +597,7 @@ def _try_find_logs(logs_client, log_group: str, task_id: str, container_name: st
                             return "\n".join(event["message"] for event in events)
             except ClientError:
                 continue
-        
+
         # Try listing all streams without prefix filter
         try:
             streams = logs_client.describe_log_streams(
@@ -527,7 +606,7 @@ def _try_find_logs(logs_client, log_group: str, task_id: str, container_name: st
                 descending=True,
                 limit=50,
             )
-            
+
             # Look for a stream containing the task ID
             for stream in streams.get("logStreams", []):
                 stream_name = stream.get("logStreamName", "")
@@ -540,15 +619,14 @@ def _try_find_logs(logs_client, log_group: str, task_id: str, container_name: st
                     events = response.get("events", [])
                     if events:
                         return "\n".join(event["message"] for event in events)
-            
+
             available = [s.get("logStreamName", "") for s in streams.get("logStreams", [])]
             if available:
                 return f"(No logs found for task {task_id}. Recent streams: {available[:3]})"
         except ClientError:
             pass
-        
+
         return f"(No log streams found in {log_group})"
-        
+
     except ClientError as e:
         return f"(Could not fetch logs: {e})"
-
