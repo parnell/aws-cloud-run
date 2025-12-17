@@ -1,10 +1,9 @@
 """Tests for Lambda runner utilities."""
 
-import pytest
-import zipfile
 import io
+import zipfile
 
-from cloud_run.lambda_runner import build_script_handler, build_deployment_zip
+from cloud_run.lambda_runner import build_deployment_zip, build_script_handler
 
 
 class TestBuildScriptHandler:
@@ -59,28 +58,27 @@ class TestBuildDeploymentZip:
         """build_deployment_zip creates a valid zip file."""
         handler_code = build_script_handler("python")
         zip_bytes = build_deployment_zip(handler_code)
-        
+
         # Should be readable as a zip file
         buffer = io.BytesIO(zip_bytes)
-        with zipfile.ZipFile(buffer, 'r') as zf:
+        with zipfile.ZipFile(buffer, "r") as zf:
             assert zf.testzip() is None  # No errors
 
     def test_zip_contains_handler(self):
         """Zip contains handler.py."""
         handler_code = build_script_handler("python")
         zip_bytes = build_deployment_zip(handler_code)
-        
+
         buffer = io.BytesIO(zip_bytes)
-        with zipfile.ZipFile(buffer, 'r') as zf:
+        with zipfile.ZipFile(buffer, "r") as zf:
             assert "handler.py" in zf.namelist()
 
     def test_zip_handler_content_matches(self):
         """Handler content in zip matches the input."""
         handler_code = build_script_handler("shell")
         zip_bytes = build_deployment_zip(handler_code)
-        
+
         buffer = io.BytesIO(zip_bytes)
-        with zipfile.ZipFile(buffer, 'r') as zf:
+        with zipfile.ZipFile(buffer, "r") as zf:
             content = zf.read("handler.py").decode("utf-8")
             assert content == handler_code
-

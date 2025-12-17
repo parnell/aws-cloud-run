@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
-
 
 LAMBDA_ASSUME_ROLE_POLICY = {
     "Version": "2012-10-17",
@@ -20,7 +18,7 @@ LAMBDA_ASSUME_ROLE_POLICY = {
 }
 
 
-def ensure_role(role_name: str, region_name: Optional[str] = None) -> str:
+def ensure_role(role_name: str, region_name: str | None = None) -> str:
     """Ensure an IAM role for Lambda exists; return its ARN.
 
     The role gets the AWSLambdaBasicExecutionRole policy attached for logs.
@@ -38,7 +36,7 @@ def ensure_role(role_name: str, region_name: Optional[str] = None) -> str:
             current_policy = json.loads(assume_policy_doc)
         else:
             current_policy = assume_policy_doc
-        
+
         # Check if the policy allows lambda.amazonaws.com to assume the role
         allows_lambda = False
         for statement in current_policy.get("Statement", []):
@@ -48,7 +46,7 @@ def ensure_role(role_name: str, region_name: Optional[str] = None) -> str:
                 if service == "lambda.amazonaws.com" and statement.get("Effect") == "Allow":
                     allows_lambda = True
                     break
-        
+
         if not allows_lambda:
             # Update trust policy to allow Lambda to assume the role
             iam.update_assume_role_policy(
@@ -106,7 +104,7 @@ def ensure_lambda(
     function_name: str,
     role_arn: str,
     zip_bytes: bytes,
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
     runtime: str = "python3.12",
     timeout: int = 900,
     memory_size: int = 512,
@@ -129,7 +127,7 @@ def ensure_lambda(
     if exists:
         # Update function code
         lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
-        
+
         # Wait for code update to complete before updating configuration
         # Lambda can be in PendingUpdate state after code update
         max_wait = 60
@@ -147,7 +145,7 @@ def ensure_lambda(
             except ClientError:
                 # If we can't get the function, wait and retry
                 time.sleep(1)
-        
+
         # Now update configuration
         # Retry if there's a conflict (update in progress)
         max_config_retries = 10
@@ -190,5 +188,3 @@ def ensure_lambda(
         Publish=True,
     )
     return create_resp["FunctionArn"]
-
-

@@ -32,3 +32,16 @@ cloud_run = "cloud_run.cli:main"
 line-length = 100
 preview = true
 
+
+[tool.ruff.lint]
+select = [
+    "I", # Enable all isort rules
+    "F", # Enable all flake8 rules
+    "UP", # Enable pyupgrade rules to modernize Python syntax
+    "B006", # Don't allow mutable default arguments. i.e. def f(x={})
+    "PLC0415", # import found outside of the top of the file
+] 
+ignore = [
+    "F841", # F841 is unused variable.
+]
+

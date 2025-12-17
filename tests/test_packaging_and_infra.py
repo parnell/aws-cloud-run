@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import os
-import base64
-import json
-
-import cloudpickle  # type: ignore
-import pytest
-from moto import mock_aws
 import boto3
+import cloudpickle  # type: ignore
+from moto import mock_aws
 
+from cloud_run.aws_infra import ensure_lambda, ensure_role
 from cloud_run.packaging import build_deployment_zip
-from cloud_run.aws_infra import ensure_role, ensure_lambda
+
 
 @mock_aws
 def test_build_zip_and_ensure_infra():
@@ -19,7 +15,7 @@ def test_build_zip_and_ensure_infra():
         return x + y
 
     zip_bytes = build_deployment_zip(cloudpickle.dumps(add))
-    assert isinstance(zip_bytes, (bytes, bytearray))
+    assert isinstance(zip_bytes, bytes | bytearray)
     assert len(zip_bytes) > 1000
 
     # Ensure IAM role
@@ -41,5 +37,3 @@ def test_build_zip_and_ensure_infra():
     fn = client.get_function(FunctionName="pi-cloud-run-test-add")
     assert fn["Configuration"]["Handler"] == "handler.lambda_handler"
     assert fn["Configuration"]["Runtime"] == "python3.8"
-
-

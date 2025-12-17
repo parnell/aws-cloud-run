@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-
-import pytest
 from moto import mock_aws
 
 from cloud_run import run
@@ -42,5 +39,3 @@ def test_run_provisions_resources():
         )
     except RuntimeError:
         pass
-
-

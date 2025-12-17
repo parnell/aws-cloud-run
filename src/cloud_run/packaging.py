@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import os
-from typing import Optional
 import zipfile
+
+import cloudpickle
 
 
 def _write_handler_py() -> str:
@@ -50,8 +51,8 @@ def _write_handler_py() -> str:
         "        print('[LOAD] Deserializing with cloudpickle...', flush=True)\n"
         "        func = cloudpickle.loads(pkl_bytes)\n"
         "        print(f'[LOAD] Function loaded: {func}', flush=True)\n"
-        "        print(f'[LOAD] Function name: {getattr(func, \"__name__\", \"unknown\")}', flush=True)\n"
-        "        print(f'[LOAD] Function module: {getattr(func, \"__module__\", \"unknown\")}', flush=True)\n"
+        '        print(f\'[LOAD] Function name: {getattr(func, "__name__", "unknown")}\', flush=True)\n'
+        '        print(f\'[LOAD] Function module: {getattr(func, "__module__", "unknown")}\', flush=True)\n'
         "        return func\n"
         "    except Exception as e:\n"
         "        print(f'[LOAD] ERROR loading function: {type(e).__name__}: {e}', flush=True)\n"
@@ -149,8 +150,6 @@ def _add_cloudpickle_to_zip(zip_file: zipfile.ZipFile) -> None:
     part of the base runtime. cloudpickle is pure-Python, so it's safe to vend.
     """
 
-    import cloudpickle  # type: ignore
-
     module_path = os.path.dirname(cloudpickle.__file__)  # .../cloudpickle
 
     for root, _dirs, files in os.walk(module_path):
@@ -175,9 +174,7 @@ def _add_module_to_zip(zip_file: zipfile.ZipFile, module_path: str) -> None:
         zip_file.writestr(f"{module_name}.py", f.read())
 
 
-def build_deployment_zip(
-    serialized_func: bytes, include_modules: Optional[list[str]] = None
-) -> bytes:
+def build_deployment_zip(serialized_func: bytes, include_modules: list[str] | None = None) -> bytes:
     """Create a deployment zip containing handler, func.pkl, cloudpickle, and optional modules.
 
     Parameters

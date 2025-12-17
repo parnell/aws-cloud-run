@@ -1,6 +1,5 @@
 """Tests for CLI utilities."""
 
-import pytest
 from pathlib import Path
 
 from cloud_run.cli import _detect_script_type
@@ -23,7 +22,9 @@ class TestDetectScriptType:
 
     def test_python_shebang(self):
         """Files with Python shebang are detected as Python."""
-        assert _detect_script_type(Path("script"), "#!/usr/bin/env python3\nprint('hi')") == "python"
+        assert (
+            _detect_script_type(Path("script"), "#!/usr/bin/env python3\nprint('hi')") == "python"
+        )
         assert _detect_script_type(Path("script"), "#!/usr/bin/python\nimport sys") == "python"
         assert _detect_script_type(Path("script"), "#! /usr/bin/env python\ncode") == "python"
 
@@ -52,4 +53,3 @@ class TestDetectScriptType:
         assert _detect_script_type(Path("script.Py"), "") == "python"
         assert _detect_script_type(Path("script.SH"), "") == "shell"
         assert _detect_script_type(Path("script.BASH"), "") == "shell"
-

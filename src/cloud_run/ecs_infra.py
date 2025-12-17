@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
 import json
+import sys
 import time
-from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
-
 
 # IAM policy for ECS task execution (pulling images, writing logs)
 ECS_TASK_EXECUTION_POLICY = {
@@ -44,7 +45,7 @@ ECS_TASK_ASSUME_ROLE_POLICY = {
 
 def ensure_ecs_execution_role(
     role_name: str = "cloud-run-ecs-execution-role",
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
 ) -> str:
     """Ensure ECS task execution role exists; return its ARN."""
     iam = boto3.client("iam", region_name=region_name)
@@ -73,7 +74,7 @@ def ensure_ecs_execution_role(
 
 def ensure_ecs_cluster(
     cluster_name: str = "cloud-run-cluster",
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
 ) -> str:
     """Ensure ECS cluster exists; return its ARN."""
     ecs = boto3.client("ecs", region_name=region_name)
@@ -99,9 +100,9 @@ def ensure_ecs_cluster(
 
 
 def get_vpc_subnets(
-    region_name: Optional[str] = None,
-    vpc_id: Optional[str] = None,
-    subnet_ids: Optional[list[str]] = None,
+    region_name: str | None = None,
+    vpc_id: str | None = None,
+    subnet_ids: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Get VPC ID and subnet IDs for running Fargate tasks.
 
@@ -168,14 +169,14 @@ def get_vpc_subnets(
 
 
 # Keep old name for compatibility
-def get_default_vpc_subnets(region_name: Optional[str] = None) -> tuple[str, list[str]]:
+def get_default_vpc_subnets(region_name: str | None = None) -> tuple[str, list[str]]:
     """Get default VPC ID and its subnet IDs. Deprecated: use get_vpc_subnets instead."""
     return get_vpc_subnets(region_name=region_name)
 
 
 def ensure_log_group(
     log_group_name: str,
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
 ) -> None:
     """Ensure CloudWatch log group exists."""
     logs = boto3.client("logs", region_name=region_name)
@@ -193,7 +194,7 @@ def register_task_definition(
     script_type: str,
     cpu: str = "256",
     memory: str = "512",
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
 ) -> str:
     """Register an ECS task definition for running scripts.
 
@@ -270,13 +271,13 @@ def run_ecs_task(
     subnet_ids: list[str],
     script_content: str,
     script_type: str = "python",
-    script_args: Optional[list[str]] = None,
-    env_vars: Optional[dict[str, str]] = None,
-    secrets: Optional[list[str]] = None,
-    runtime_secrets: Optional[list[str]] = None,
+    script_args: list[str] | None = None,
+    env_vars: dict[str, str] | None = None,
+    secrets: list[str] | None = None,
+    runtime_secrets: list[str] | None = None,
     container_name: str = "script-runner",
-    security_group_ids: Optional[list[str]] = None,
-    region_name: Optional[str] = None,
+    security_group_ids: list[str] | None = None,
+    region_name: str | None = None,
 ) -> str:
     """Run an ECS Fargate task; return task ARN.
 
@@ -288,10 +289,6 @@ def run_ecs_task(
     - If the image has ENTRYPOINT with 'exec "$@"' pattern: our command runs after setup ✓
     - If the image has a fixed ENTRYPOINT: may conflict (use a different task definition)
     """
-    import base64
-    import gzip
-    import json
-    import sys
 
     ecs = boto3.client("ecs", region_name=region_name)
 
@@ -369,28 +366,36 @@ def run_ecs_task(
                     if isinstance(secret_dict, dict):
                         count = len(secret_dict)
                         all_env_vars.update({str(k): str(v) for k, v in secret_dict.items()})
-                        print(f"[cloud_run] Loaded {count} environment variables from '{secret_name}'", file=sys.stderr)
+                        print(
+                            f"[cloud_run] Loaded {count} environment variables from '{secret_name}'",
+                            file=sys.stderr,
+                        )
                     else:
-                        print(f"[cloud_run] Warning: Secret '{secret_name}' is not a JSON object, skipping", file=sys.stderr)
+                        print(
+                            f"[cloud_run] Warning: Secret '{secret_name}' is not a JSON object, skipping",
+                            file=sys.stderr,
+                        )
             except Exception as e:
                 raise RuntimeError(f"Failed to fetch secret '{secret_name}': {e}")
 
     # Add environment variables if provided
     if all_env_vars:
-        container_override["environment"] = [{"name": k, "value": v} for k, v in all_env_vars.items()]
+        container_override["environment"] = [
+            {"name": k, "value": v} for k, v in all_env_vars.items()
+        ]
 
     # Check container overrides size before calling API
     overrides = {"containerOverrides": [container_override]}
     overrides_json = json.dumps(overrides)
     overrides_size = len(overrides_json)
-    
+
     ECS_OVERRIDES_LIMIT = 8192
     if overrides_size > ECS_OVERRIDES_LIMIT:
         # Calculate breakdown for helpful warning message
         command_size = len(json.dumps(container_override.get("command", [])))
         env_size = len(json.dumps(container_override.get("environment", [])))
         env_count = len(all_env_vars) if all_env_vars else 0
-        
+
         print(
             f"[cloud_run] WARNING: Container overrides exceed ECS limit of {ECS_OVERRIDES_LIMIT} bytes.\n"
             f"  Total size: {overrides_size} bytes (limit: {ECS_OVERRIDES_LIMIT})\n"
@@ -398,7 +403,7 @@ def run_ecs_task(
             f"  - Environment variables ({env_count}): {env_size} bytes",
             file=sys.stderr,
         )
-        
+
         if env_size > command_size:
             print(
                 "\nThe environment variables are the main contributor. Consider:\n"
@@ -413,7 +418,7 @@ def run_ecs_task(
                 "  2. Moving logic to a pre-built container image",
                 file=sys.stderr,
             )
-        
+
         print("[cloud_run] Attempting to run anyway...", file=sys.stderr)
 
     response = ecs.run_task(
@@ -434,17 +439,16 @@ def run_ecs_task(
 def wait_for_task_completion(
     cluster_arn: str,
     task_arn: str,
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
     poll_interval: int = 5,
     timeout: int = 3600,
-    log_group: Optional[str] = None,
-    container_name: Optional[str] = None,
+    log_group: str | None = None,
+    container_name: str | None = None,
 ) -> dict:
     """Wait for ECS task to complete; return task info.
 
     If log_group and container_name are provided, streams logs in real-time.
     """
-    import sys
 
     ecs = boto3.client("ecs", region_name=region_name)
     logs_client = boto3.client("logs", region_name=region_name) if log_group else None
@@ -499,9 +503,7 @@ def wait_for_task_completion(
     raise RuntimeError(f"Task {task_arn} did not complete within {timeout} seconds")
 
 
-def _find_log_stream(
-    logs_client, log_group: str, task_id: str, container_name: str
-) -> Optional[str]:
+def _find_log_stream(logs_client, log_group: str, task_id: str, container_name: str) -> str | None:
     """Find the log stream for a task."""
     # Try common patterns
     patterns = [
@@ -551,8 +553,8 @@ def _find_log_stream(
 
 
 def _stream_new_logs(
-    logs_client, log_group: str, log_stream: str, next_token: Optional[str]
-) -> Optional[str]:
+    logs_client, log_group: str, log_stream: str, next_token: str | None
+) -> str | None:
     """Fetch and print new log events, return next token."""
     try:
         kwargs = {
@@ -583,7 +585,7 @@ def get_task_logs(
     log_group: str,
     task_id: str,
     container_name: str = "script-runner",
-    region_name: Optional[str] = None,
+    region_name: str | None = None,
 ) -> str:
     """Fetch CloudWatch logs for an ECS task."""
     logs_client = boto3.client("logs", region_name=region_name)

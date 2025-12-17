@@ -6,13 +6,13 @@ from pathlib import Path
 
 import boto3
 
-from .lambda_runner import run_on_lambda
 from .ecs_runner import (
     list_ecs_tasks,
     list_task_definitions,
     list_vpcs,
     run_on_ecs,
 )
+from .lambda_runner import run_on_lambda
 
 
 def _detect_script_type(script_path: Path, script_content: str) -> str:
@@ -54,7 +54,8 @@ def main():
         help="Arguments to pass to the script (after -- separator)",
     )
     parser.add_argument(
-        "-e", "--env-var",
+        "-e",
+        "--env-var",
         action="append",
         dest="env_vars",
         metavar="KEY=VALUE",
@@ -100,8 +101,12 @@ def main():
         help="Create ECS cluster if it doesn't exist",
     )
     parser.add_argument("--vpc", help="VPC name or ID for ECS tasks (optional, can be inferred)")
-    parser.add_argument("--subnets", help="Comma-separated subnet IDs (optional, can be inferred from cluster)")
-    parser.add_argument("--security-groups", help="Comma-separated security group IDs (optional, can be inferred)")
+    parser.add_argument(
+        "--subnets", help="Comma-separated subnet IDs (optional, can be inferred from cluster)"
+    )
+    parser.add_argument(
+        "--security-groups", help="Comma-separated security group IDs (optional, can be inferred)"
+    )
     parser.add_argument("--list-tasks", action="store_true", help="List recent ECS tasks and exit")
     parser.add_argument(
         "--list-task-definitions",
@@ -141,7 +146,9 @@ def main():
 
     # Script is required for running
     if not args.script:
-        parser.error("script is required unless using --list-tasks, --list-task-definitions, or --list-vpcs")
+        parser.error(
+            "script is required unless using --list-tasks, --list-task-definitions, or --list-vpcs"
+        )
 
     # Read the script file
     script_path = Path(args.script)
@@ -149,7 +156,7 @@ def main():
         print(f"Error: Script file '{args.script}' not found", file=sys.stderr)
         sys.exit(1)
 
-    with open(script_path, "r") as f:
+    with open(script_path) as f:
         script_content = f.read()
 
     # Detect script type
@@ -177,7 +184,10 @@ def main():
     if args.env_vars:
         for env_var in args.env_vars:
             if "=" not in env_var:
-                print(f"Error: Environment variable '{env_var}' must be in KEY=VALUE format", file=sys.stderr)
+                print(
+                    f"Error: Environment variable '{env_var}' must be in KEY=VALUE format",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             key, value = env_var.split("=", 1)
             env_vars[key] = value
@@ -193,7 +203,7 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-        
+
         # Parse subnets and security groups if provided
         subnet_ids = args.subnets.split(",") if args.subnets else None
         security_group_ids = args.security_groups.split(",") if args.security_groups else None
