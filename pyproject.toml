@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.40.21",
     "cloudpickle>=3.0.0",
+    "pre-commit>=4.5.1",
     "pydantic>=2.0.0",
 ]
 
