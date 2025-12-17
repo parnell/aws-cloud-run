@@ -1,6 +1,5 @@
 """Tests for ECS utility functions."""
 
-import pytest
 from datetime import datetime, timezone, timedelta
 
 from cloud_run.ecs_infra import _strip_shell_comments
@@ -113,11 +112,11 @@ class TestHumanReadableTime:
     def test_minutes_ago(self):
         """Times in the past few minutes show 'X minute(s) ago'."""
         now = datetime.now(timezone.utc)
-        
+
         # 1 minute ago
         one_min_ago = now - timedelta(minutes=1)
         assert "minute" in _human_readable_time(one_min_ago)
-        
+
         # 30 minutes ago
         thirty_min_ago = now - timedelta(minutes=30)
         result = _human_readable_time(thirty_min_ago)
@@ -126,11 +125,11 @@ class TestHumanReadableTime:
     def test_hours_ago(self):
         """Times in the past few hours show 'X hour(s) ago'."""
         now = datetime.now(timezone.utc)
-        
+
         # 1 hour ago
         one_hour_ago = now - timedelta(hours=1)
         assert "hour" in _human_readable_time(one_hour_ago)
-        
+
         # 5 hours ago
         five_hours_ago = now - timedelta(hours=5)
         assert "hour" in _human_readable_time(five_hours_ago)
@@ -138,7 +137,7 @@ class TestHumanReadableTime:
     def test_days_ago(self):
         """Times in the past few days show 'X day(s) ago'."""
         now = datetime.now(timezone.utc)
-        
+
         # 2 days ago
         two_days_ago = now - timedelta(days=2)
         assert "day" in _human_readable_time(two_days_ago)
@@ -163,4 +162,3 @@ class TestHumanReadableTime:
         naive_dt = aware_dt.replace(tzinfo=None)
         result = _human_readable_time(naive_dt)
         assert "minute" in result
-
