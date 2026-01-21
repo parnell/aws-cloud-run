@@ -1,12 +1,8 @@
 """ECS Fargate execution utilities for cloud_run."""
 
-import json
-import re
 import sys
 import time
 import traceback
-import urllib.request
-from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
@@ -20,6 +16,13 @@ from .ecs_infra import (
     run_ecs_task,
     wait_for_task_completion,
 )
+from .lib.ecr_utils import get_image_entrypoint
+from .lib.ecs_utils import (
+    get_cluster_arn,
+    infer_network_from_cluster,
+    list_cluster_task_definitions,
+)
+from .lib.time_utils import human_readable_time
 
 
 class ECSConfig(BaseModel):
@@ -401,298 +404,6 @@ def list_task_definitions(region: str, prefix: str | None = None) -> None:
         )
 
 
-def _get_cluster_arn(ecs, cluster_name: str) -> str | None:
-    """Get cluster ARN if it exists, None otherwise."""
-    try:
-        response = ecs.describe_clusters(clusters=[cluster_name])
-        active_clusters = [c for c in response.get("clusters", []) if c["status"] == "ACTIVE"]
-        if active_clusters:
-            return active_clusters[0]["clusterArn"]
-    except Exception:
-        pass
-    return None
-
-
-def _parse_ecr_image_uri(image_uri: str) -> dict | None:
-    """Parse an ECR image URI into its components.
-
-    Returns dict with registry, repository, tag/digest, or None if not an ECR image.
-    """
-    # ECR format: <account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
-    # or: <account>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:<digest>
-    ecr_pattern = r"^(\d+)\.dkr\.ecr\.([^.]+)\.amazonaws\.com/([^:@]+)(?::([^@]+)|@(.+))?$"
-    match = re.match(ecr_pattern, image_uri)
-
-    if not match:
-        return None
-
-    return {
-        "account": match.group(1),
-        "region": match.group(2),
-        "repository": match.group(3),
-        "tag": match.group(4) or "latest",
-        "digest": match.group(5),
-    }
-
-
-def _get_image_entrypoint(image_uri: str, region: str) -> dict | None:
-    """Get the ENTRYPOINT from a Docker image in ECR.
-
-    Returns dict with:
-        - entrypoint: list or None
-        - cmd: list or None
-        - safe: bool (True if entrypoint is safe for command override)
-        - reason: str (explanation)
-
-    Returns None if unable to inspect (non-ECR image, access denied, etc.)
-    """
-    parsed = _parse_ecr_image_uri(image_uri)
-    if not parsed:
-        # Not an ECR image (e.g., python:3.11 from Docker Hub)
-        # We can't inspect it, but public images are usually safe
-        return {
-            "entrypoint": None,
-            "cmd": None,
-            "safe": True,
-            "reason": "public image (cannot inspect, assuming safe)",
-        }
-
-    try:
-        # Use the region from the image URI, not the task region
-        ecr = boto3.client("ecr", region_name=parsed["region"])
-
-        # Get the image manifest
-        image_id = (
-            {"imageTag": parsed["tag"]} if parsed["tag"] else {"imageDigest": parsed["digest"]}
-        )
-
-        response = ecr.batch_get_image(
-            repositoryName=parsed["repository"],
-            imageIds=[image_id],
-            acceptedMediaTypes=["application/vnd.docker.distribution.manifest.v2+json"],
-        )
-
-        if not response.get("images"):
-            return None
-
-        manifest = json.loads(response["images"][0]["imageManifest"])
-        config_digest = manifest.get("config", {}).get("digest")
-
-        if not config_digest:
-            return None
-
-        # Get the image config blob
-        blob_response = ecr.get_download_url_for_layer(
-            repositoryName=parsed["repository"],
-            layerDigest=config_digest,
-        )
-
-        # Download the config
-
-        with urllib.request.urlopen(blob_response["downloadUrl"]) as resp:
-            config = json.loads(resp.read().decode())
-
-        # Extract entrypoint and cmd from config
-        container_config = config.get("config", {})
-        entrypoint = container_config.get("Entrypoint")
-        cmd = container_config.get("Cmd")
-
-        # Determine if it's safe for command override
-        safe = True
-        reason = ""
-
-        if not entrypoint:
-            safe = True
-            reason = "no entrypoint"
-        elif entrypoint in [["python"], ["python3"], ["/bin/sh", "-c"], ["/bin/bash", "-c"]]:
-            safe = True
-            reason = f"shell-style entrypoint: {entrypoint}"
-        else:
-            # Unknown entrypoint - could be safe if it uses exec "$@", but we can't tell
-            safe = False
-            reason = f"custom entrypoint: {entrypoint}"
-
-        return {
-            "entrypoint": entrypoint,
-            "cmd": cmd,
-            "safe": safe,
-            "reason": reason,
-        }
-
-    except Exception as e:
-        # Can't inspect - might be access denied, image doesn't exist, etc.
-        return {
-            "entrypoint": None,
-            "cmd": None,
-            "safe": None,  # Unknown
-            "reason": f"could not inspect: {e}",
-        }
-
-
-def _list_cluster_task_definitions(ecs, cluster_arn: str, region: str) -> list[dict]:
-    """List all unique task definitions from a cluster with their status and warnings.
-
-    Returns list of dicts with:
-        - family: task definition family name
-        - task_def_arn: full ARN
-        - status: 'running' or 'stopped'
-        - service: service name if started by a service
-        - containers: list of container names
-        - container_count: number of containers
-        - image: image URI (of first container)
-        - warnings: list of warning strings
-        - usable: True if safe to use without issues
-    """
-    try:
-        # Get running and stopped tasks
-        running = ecs.list_tasks(cluster=cluster_arn, desiredStatus="RUNNING", maxResults=20)
-        stopped = ecs.list_tasks(cluster=cluster_arn, desiredStatus="STOPPED", maxResults=20)
-
-        all_task_arns = running.get("taskArns", []) + stopped.get("taskArns", [])
-
-        if not all_task_arns:
-            return []
-
-        # Get task details
-        tasks_response = ecs.describe_tasks(cluster=cluster_arn, tasks=all_task_arns)
-        tasks = tasks_response.get("tasks", [])
-
-        # Group by task definition family and get unique ones
-        seen_families = {}
-
-        for task in tasks:
-            task_def_arn = task.get("taskDefinitionArn")
-            if not task_def_arn:
-                continue
-
-            # Extract family from ARN
-            family = task_def_arn.split("/")[-1].rsplit(":", 1)[0]
-
-            # Keep the most recent/relevant task for each family
-            if family in seen_families:
-                # Prefer running over stopped
-                existing = seen_families[family]
-                if existing["status"] == "running":
-                    continue
-
-            status = "running" if task.get("lastStatus") == "RUNNING" else "stopped"
-            started_by = task.get("startedBy", "")
-            service = None
-            if started_by.startswith("ecs-svc/"):
-                # Extract service name from group
-                group = task.get("group", "")
-                if group.startswith("service:"):
-                    service = group[8:]
-
-            seen_families[family] = {
-                "task_def_arn": task_def_arn,
-                "status": status,
-                "service": service,
-                "created_at": task.get("createdAt"),
-            }
-
-        # Now get full task definition details for each unique family
-        results = []
-
-        for family, task_info in seen_families.items():
-            try:
-                response = ecs.describe_task_definition(taskDefinition=task_info["task_def_arn"])
-            except Exception:
-                continue
-
-            task_def = response.get("taskDefinition", {})
-            containers = task_def.get("containerDefinitions", [])
-
-            if not containers:
-                continue
-
-            container_names = [c.get("name", "?") for c in containers]
-            first_container = containers[0]
-            image = first_container.get("image", "")
-
-            # Analyze warnings
-            warnings = []
-            usable = True
-
-            # Check for multiple containers
-            if len(containers) > 1:
-                warnings.append(
-                    f"Has {len(containers)} containers (sidecars will also run): {container_names}"
-                )
-                usable = False
-
-            # Check for entrypoint override in task def
-            entrypoint = first_container.get("entryPoint")
-            if entrypoint:
-                warnings.append(f"Has custom entryPoint: {entrypoint}")
-                usable = False
-
-            # Check image entrypoint
-            if image:
-                image_info = _get_image_entrypoint(image, region)
-                if image_info and image_info.get("safe") is False:
-                    warnings.append(f"Image {image_info.get('reason')}")
-                    usable = False
-
-            # Extract log group
-            log_config = first_container.get("logConfiguration", {})
-            log_group = None
-            if log_config.get("logDriver") == "awslogs":
-                log_group = log_config.get("options", {}).get("awslogs-group")
-            if not log_group:
-                log_group = f"/ecs/{family}"
-
-            results.append({
-                "family": family,
-                "task_def_arn": task_info["task_def_arn"],
-                "status": task_info["status"],
-                "service": task_info["service"],
-                "created_at": task_info["created_at"],
-                "containers": container_names,
-                "container_count": len(containers),
-                "container_name": container_names[0],
-                "image": image,
-                "log_group": log_group,
-                "warnings": warnings,
-                "usable": usable,
-            })
-
-        # Sort: usable first, then running, then by name
-        results.sort(key=lambda x: (not x["usable"], x["status"] != "running", x["family"]))
-
-        return results
-    except Exception:
-        return []
-
-
-def _human_readable_time(dt) -> str:
-    """Convert a datetime to human-readable relative time."""
-
-    if dt is None:
-        return "unknown"
-
-    now = datetime.now(UTC)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-
-    diff = now - dt
-    seconds = diff.total_seconds()
-
-    if seconds < 60:
-        return "just now"
-    elif seconds < 3600:
-        mins = int(seconds / 60)
-        return f"{mins} minute{'s' if mins != 1 else ''} ago"
-    elif seconds < 86400:
-        hours = int(seconds / 3600)
-        return f"{hours} hour{'s' if hours != 1 else ''} ago"
-    elif seconds < 604800:
-        days = int(seconds / 86400)
-        return f"{days} day{'s' if days != 1 else ''} ago"
-    else:
-        return dt.strftime("%Y-%m-%d")
-
-
 # ANSI color codes
 class Colors:
     GREEN = "\033[32m"
@@ -733,7 +444,7 @@ def _print_cluster_task_definitions(task_defs: list[dict], cluster_name: str) ->
         print(f"  {icon} {name_color}{td['family']}{Colors.RESET} {status_str}", file=sys.stderr)
 
         # Show last used time
-        last_used = _human_readable_time(td.get("created_at"))
+        last_used = human_readable_time(td.get("created_at"))
         print(f"      Last used: {last_used}", file=sys.stderr)
 
         # Show image (truncated)
@@ -751,76 +462,6 @@ def _print_cluster_task_definitions(task_defs: list[dict], cluster_name: str) ->
             print(f"      {Colors.YELLOW}⚠ {warning}{Colors.RESET}", file=sys.stderr)
 
         print("", file=sys.stderr)
-
-
-def _get_network_from_cluster(ecs, cluster_arn: str) -> dict | None:
-    """Try to infer network config (subnets, security groups) from cluster services or tasks."""
-
-    # First try services - they have stable network configuration
-    try:
-        services_response = ecs.list_services(cluster=cluster_arn, maxResults=10)
-        service_arns = services_response.get("serviceArns", [])
-
-        if service_arns:
-            services_detail = ecs.describe_services(cluster=cluster_arn, services=service_arns[:5])
-            for service in services_detail.get("services", []):
-                network_config = service.get("networkConfiguration", {}).get(
-                    "awsvpcConfiguration", {}
-                )
-                subnets = network_config.get("subnets", [])
-                security_groups = network_config.get("securityGroups", [])
-                if subnets:
-                    return {
-                        "subnets": subnets,
-                        "security_groups": security_groups,
-                        "source": f"service {service.get('serviceName', 'unknown')}",
-                    }
-    except Exception:
-        pass
-
-    # Fall back to recent tasks
-    try:
-        # List recent tasks
-        response = ecs.list_tasks(cluster=cluster_arn, maxResults=10)
-        task_arns = response.get("taskArns", [])
-
-        # Also check stopped tasks
-        stopped_response = ecs.list_tasks(
-            cluster=cluster_arn, desiredStatus="STOPPED", maxResults=10
-        )
-        task_arns.extend(stopped_response.get("taskArns", []))
-
-        if not task_arns:
-            return None
-
-        # Get task details
-        tasks_response = ecs.describe_tasks(cluster=cluster_arn, tasks=task_arns[:5])
-        tasks = tasks_response.get("tasks", [])
-
-        # Find subnets and security groups from network configuration
-        for task in tasks:
-            attachments = task.get("attachments", [])
-            subnets = []
-            security_groups = []
-
-            for attachment in attachments:
-                if attachment.get("type") == "ElasticNetworkInterface":
-                    for detail in attachment.get("details", []):
-                        if detail.get("name") == "subnetId" and detail.get("value"):
-                            subnets.append(detail["value"])
-                        elif detail.get("name") == "networkInterfaceId":
-                            # We could look up the ENI to get security groups
-                            pass
-
-            if subnets:
-                return {
-                    "subnets": list(set(subnets)),
-                    "security_groups": security_groups,
-                    "source": "recent task",
-                }
-        return None
-    except Exception:
-        return None
 
 
 def _resolve_ecs_config(
@@ -853,7 +494,7 @@ def _resolve_ecs_config(
     print("[cloud_run] Resolving ECS configuration...", file=sys.stderr)
 
     # 1. Resolve cluster
-    cluster_arn = _get_cluster_arn(ecs, cluster_name)
+    cluster_arn = get_cluster_arn(ecs, cluster_name)
     if cluster_arn:
         config.cluster_arn = cluster_arn
         print(f"[cloud_run]   Cluster: {cluster_name} ✓", file=sys.stderr)
@@ -909,7 +550,7 @@ def _resolve_ecs_config(
             # Check image entrypoint
             image = containers[0].get("image", "")
             if image:
-                image_info = _get_image_entrypoint(image, region)
+                image_info = get_image_entrypoint(image, region)
                 if image_info and image_info.get("safe") is False:
                     warnings.append(f"Image {image_info.get('reason')}")
                     warnings.append(
@@ -930,7 +571,7 @@ def _resolve_ecs_config(
     else:
         # No task definition specified - list available ones and ask user to choose
         if cluster_arn:
-            task_defs = _list_cluster_task_definitions(ecs, cluster_arn, region)
+            task_defs = list_cluster_task_definitions(ecs, cluster_arn, region)
 
             if task_defs:
                 _print_cluster_task_definitions(task_defs, cluster_name)
@@ -1005,7 +646,7 @@ def _resolve_ecs_config(
 
     # Then try to infer from cluster's services/tasks
     if not resolved_subnets and cluster_arn:
-        network_config = _get_network_from_cluster(ecs, cluster_arn)
+        network_config = infer_network_from_cluster(ecs, cluster_arn)
         if network_config:
             resolved_subnets = network_config["subnets"]
             if not resolved_security_groups and network_config.get("security_groups"):
