@@ -1,8 +1,9 @@
 """Tests for ECS utility functions."""
 
+import subprocess
 from datetime import UTC, datetime, timedelta
 
-from cloud_run.ecs_infra import _strip_shell_comments
+from cloud_run.ecs_infra import _build_ecs_command, _strip_shell_comments
 from cloud_run.lib.ecr_utils import parse_ecr_image_uri
 from cloud_run.lib.time_utils import human_readable_time
 
@@ -47,6 +48,46 @@ class TestStripShellComments:
         script = "#!/bin/bash"
         result = _strip_shell_comments(script)
         assert result == "#!/bin/bash"
+
+
+class TestBuildEcsCommand:
+    """Tests for compressed ECS command generation."""
+
+    def test_python_command_round_trips_script_and_args(self):
+        """Generated Python command executes the original script with arguments."""
+        script = "import sys\nprint('|'.join(sys.argv))"
+
+        command, codec, encoding, payload_size = _build_ecs_command(
+            script,
+            "python",
+            ["hello world", "again"],
+            None,
+        )
+
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+
+        assert result.stdout.strip() == "script|hello world|again"
+        assert codec in {"gzip", "zlib", "bz2", "lzma"}
+        assert encoding in {"b64", "b85"}
+        assert payload_size > 0
+
+    def test_shell_command_round_trips_script_and_args(self):
+        """Generated shell command executes the original script with arguments."""
+        script = 'printf "%s\\n" "$0|$1|$2"'
+
+        command, codec, encoding, payload_size = _build_ecs_command(
+            script,
+            "shell",
+            ["hello world", "again"],
+            None,
+        )
+
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+
+        assert result.stdout.strip() == "bash|hello world|again"
+        assert codec in {"gzip", "zlib", "bz2", "lzma"}
+        assert encoding in {"b64", "b85"}
+        assert payload_size > 0
 
 
 class TestParseECRImageUri:

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import bz2
 import gzip
 import json
+import lzma
 import sys
 import time
+import zlib
 
 import boto3
 from botocore.exceptions import ClientError
@@ -265,6 +268,85 @@ def _strip_shell_comments(script: str) -> str:
     return "\n".join(lines)
 
 
+def _compression_variants(script_content: str) -> list[tuple[str, str, str]]:
+    """Return stdlib-compressed script payloads as (codec, encoding, payload)."""
+    script_bytes = script_content.encode()
+    compressors = (
+        ("gzip", lambda data: gzip.compress(data, compresslevel=9, mtime=0)),
+        ("zlib", lambda data: zlib.compress(data, level=9)),
+        ("bz2", lambda data: bz2.compress(data, compresslevel=9)),
+        ("lzma", lambda data: lzma.compress(data, preset=9)),
+    )
+    encoders = (
+        ("b64", base64.b64encode),
+        ("b85", base64.b85encode),
+    )
+
+    variants = []
+    for codec, compress in compressors:
+        compressed = compress(script_bytes)
+        for encoding, encode in encoders:
+            variants.append((codec, encoding, encode(compressed).decode()))
+    return variants
+
+
+def _build_runtime_secrets_loader(runtime_secrets: list[str] | None) -> str:
+    """Build Python code that loads Secrets Manager values inside the ECS container."""
+    if not runtime_secrets:
+        return ""
+
+    secrets_json = json.dumps(runtime_secrets, separators=(",", ":"))
+    return (
+        "sm=boto3.client('secretsmanager');"
+        "[os.environ.update({str(k):str(v) for k,v in "
+        "json.loads(sm.get_secret_value(SecretId=s).get('SecretString','{}')).items()}) "
+        f"for s in {secrets_json}];"
+    )
+
+
+def _build_ecs_command(
+    script_content: str,
+    script_type: str,
+    args_list: list[str],
+    runtime_secrets: list[str] | None,
+) -> tuple[list[str], str, str, int]:
+    """Build the smallest ECS command using stdlib compression/encoding choices."""
+    args_literal = json.dumps(args_list, separators=(",", ":"))
+    secrets_loader = _build_runtime_secrets_loader(runtime_secrets)
+    best: tuple[int, list[str], str, str, int] | None = None
+
+    for codec, encoding, payload in _compression_variants(script_content):
+        decoder = "b.b85decode" if encoding == "b85" else "b.b64decode"
+        payload_literal = json.dumps(payload)
+        script_expr = f"c.decompress({decoder}({payload_literal})).decode()"
+
+        imports = f"import base64 as b,{codec} as c,sys"
+        if script_type != "python":
+            imports += ",subprocess as p"
+        if runtime_secrets:
+            imports += ",boto3,os,json"
+        imports += ";"
+
+        if script_type == "python":
+            runner = f"sys.argv=['script']+{args_literal};exec({script_expr})"
+        else:
+            runner = f"sys.exit(p.call(['/bin/bash','-c',{script_expr},'bash']+{args_literal}))"
+
+        command = [
+            "python" if script_type == "python" else "python3",
+            "-c",
+            imports + secrets_loader + runner,
+        ]
+        command_size = len(json.dumps(command))
+        candidate = (command_size, command, codec, encoding, len(payload))
+        if best is None or command_size < best[0]:
+            best = candidate
+
+    assert best is not None
+    _, command, codec, encoding, payload_size = best
+    return command, codec, encoding, payload_size
+
+
 def run_ecs_task(
     cluster_arn: str,
     task_definition_arn: str,
@@ -281,8 +363,8 @@ def run_ecs_task(
 ) -> str:
     """Run an ECS Fargate task; return task ARN.
 
-    The script is stripped of comments, gzip compressed, and base64-encoded.
-    For very large scripts (>5KB compressed), uploads to S3 and uses boto3 to fetch.
+    Shell scripts are stripped of comment-only and blank lines, then the smallest
+    stdlib compression/encoding command is selected for the ECS override.
 
     Note: ECS API only allows overriding 'command', not 'entryPoint'.
     - If the image has no ENTRYPOINT: our command runs directly ✓
@@ -303,41 +385,21 @@ def run_ecs_task(
                 file=sys.stderr,
             )
 
-    # Gzip compress then base64 encode the script
-    compressed = gzip.compress(script_content.encode())
-    script_b64 = base64.b64encode(compressed).decode()
-
-    # Prepare args
     args_list = script_args or []
-    args_json = json.dumps(args_list)
 
-    # Show script size info
-    print(f"[cloud_run] Script size after compression: {len(script_b64)} bytes", file=sys.stderr)
+    # Build command that decompresses and executes the script inline.
+    # Each candidate is exact script bytes through a stdlib compressor/decoder pair.
+    command, codec, encoding, payload_size = _build_ecs_command(
+        script_content,
+        script_type,
+        args_list,
+        runtime_secrets,
+    )
 
-    # Build secret-fetching code if runtime_secrets specified
-    # This fetches secrets inside the container using boto3, avoiding the 8KB override limit
-    secrets_loader = ""
-    if runtime_secrets:
-        secrets_json = json.dumps(runtime_secrets)
-        # Compact single-line Python using list comprehension and exec
-        # Fetches each secret, parses JSON, exports all keys as env vars
-        secrets_loader = f"import boto3,os;_sm=boto3.client('secretsmanager');[os.environ.update({{str(k):str(v) for k,v in json.loads(_sm.get_secret_value(SecretId=s).get('SecretString','{{}}')).items()}}) for s in {secrets_json}];"
-
-    # Build command that decompresses and executes the script inline
-    if script_type == "python":
-        command = [
-            "python",
-            "-c",
-            f"import base64,gzip,sys,json;{secrets_loader}sys.argv=['script']+json.loads('{args_json}');exec(gzip.decompress(base64.b64decode('{script_b64}')).decode())",
-        ]
-    else:
-        # For bash: use Python subprocess to run bash with the script
-        # This avoids writing to disk (read-only filesystem) and handles args properly
-        command = [
-            "python3",
-            "-c",
-            f"import base64,gzip,subprocess,sys,json;{secrets_loader}script=gzip.decompress(base64.b64decode('{script_b64}')).decode();args=json.loads('{args_json}');sys.exit(subprocess.call(['/bin/bash','-c',script,'bash']+args))",
-        ]
+    print(
+        f"[cloud_run] Script size after compression: {payload_size} bytes ({codec}+{encoding})",
+        file=sys.stderr,
+    )
 
     # Build network configuration
     network_config = {
