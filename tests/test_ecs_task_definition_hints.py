@@ -1,7 +1,5 @@
 """Tests for ECS task definition resolution without DescribeTaskDefinition."""
 
-import pytest
-
 import cloud_run.ecs_runner as ecs_runner
 from cloud_run.lib.ecs_utils import extract_task_definition_family
 
@@ -18,10 +16,7 @@ class TestExtractTaskDefinitionFamily:
         )
 
     def test_arn(self):
-        arn = (
-            "arn:aws:ecs:us-east-2:324037281424:task-definition/"
-            "scaffold-prod-analyze-job:12"
-        )
+        arn = "arn:aws:ecs:us-east-2:324037281424:task-definition/scaffold-prod-analyze-job:12"
         assert extract_task_definition_family(arn) == "scaffold-prod-analyze-job"
 
 

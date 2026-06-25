@@ -689,20 +689,16 @@ def _resolve_ecs_config(
                 file=sys.stderr,
             )
     else:
-        hint = (
-            "Run 'cloud_run --list-vpcs' to see available VPCs and subnets."
-        )
+        hint = "Run 'cloud_run --list-vpcs' to see available VPCs and subnets."
         if container_name:
             hint = (
                 "Roles without ecs:DescribeServices / ec2:DescribeSubnets cannot infer "
                 "network config from the cluster. Pass --subnets and --security-groups "
-                "explicitly (see README for Scaffold prod examples).\n"
-                + hint
+                "explicitly (see README for Scaffold prod examples).\n" + hint
             )
         raise RuntimeError(
             "Could not determine subnets. Provide --subnets or --vpc, "
-            "or ensure a service is running in the cluster.\n"
-            + hint
+            "or ensure a service is running in the cluster.\n" + hint
         )
 
     print("[cloud_run] Configuration resolved ✓", file=sys.stderr)
