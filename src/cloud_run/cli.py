@@ -94,6 +94,15 @@ def main():
         "--task-definition",
         help="Use existing ECS task definition (ARN or family:revision)",
     )
+    parser.add_argument(
+        "--container-name",
+        help="ECS container name (with --task-definition, skips ecs:DescribeTaskDefinition)",
+    )
+    parser.add_argument(
+        "--log-group",
+        help="CloudWatch log group for the container (optional with --container-name; "
+        "defaults to /ecs/<family>)",
+    )
     parser.add_argument("--cluster", help="ECS cluster name (required for --ecs)")
     parser.add_argument(
         "--create-cluster",
@@ -106,6 +115,12 @@ def main():
     )
     parser.add_argument(
         "--security-groups", help="Comma-separated security group IDs (optional, can be inferred)"
+    )
+    parser.add_argument(
+        "--assign-public-ip",
+        choices=["enabled", "disabled"],
+        default="enabled",
+        help="Fargate assignPublicIp for awsvpc (default: enabled; use disabled for private subnets)",
     )
     parser.add_argument("--list-tasks", action="store_true", help="List recent ECS tasks and exit")
     parser.add_argument(
@@ -207,6 +222,20 @@ def main():
         # Parse subnets and security groups if provided
         subnet_ids = args.subnets.split(",") if args.subnets else None
         security_group_ids = args.security_groups.split(",") if args.security_groups else None
+
+        if args.container_name and not args.task_definition:
+            print(
+                "Error: --container-name requires --task-definition",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.log_group and not args.task_definition:
+            print(
+                "Error: --log-group requires --task-definition",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         run_on_ecs(
             script_content,
             script_type,
@@ -223,6 +252,9 @@ def main():
             env_vars,
             secrets,
             args.runtime_secrets,
+            args.container_name,
+            args.log_group,
+            args.assign_public_ip.upper(),
         )
     else:
         function_name = args.function_name or f"cloud-run-script-{script_type}"

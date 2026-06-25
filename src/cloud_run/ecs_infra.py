@@ -359,6 +359,7 @@ def run_ecs_task(
     runtime_secrets: list[str] | None = None,
     container_name: str = "script-runner",
     security_group_ids: list[str] | None = None,
+    assign_public_ip: str = "ENABLED",
     region_name: str | None = None,
 ) -> str:
     """Run an ECS Fargate task; return task ARN.
@@ -404,7 +405,7 @@ def run_ecs_task(
     # Build network configuration
     network_config = {
         "subnets": subnet_ids[:3],  # Use up to 3 subnets
-        "assignPublicIp": "ENABLED",  # Needed to pull images if no NAT
+        "assignPublicIp": assign_public_ip,
     }
     if security_group_ids:
         network_config["securityGroups"] = security_group_ids

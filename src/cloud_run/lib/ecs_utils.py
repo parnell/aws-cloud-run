@@ -4,6 +4,16 @@ from .aws_auth import aws_auth_error_message, is_aws_auth_error
 from .ecr_utils import get_image_entrypoint
 
 
+def extract_task_definition_family(task_definition: str) -> str:
+    """Extract family name from a task definition ARN, family:revision, or family."""
+    if task_definition.startswith("arn:"):
+        name_part = task_definition.split("/")[-1]
+        return name_part.rsplit(":", 1)[0]
+    if ":" in task_definition:
+        return task_definition.rsplit(":", 1)[0]
+    return task_definition
+
+
 def get_cluster_arn(ecs, cluster_name: str) -> str | None:
     """Get cluster ARN if it exists, None otherwise."""
     try:

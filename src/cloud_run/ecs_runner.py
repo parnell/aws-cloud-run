@@ -18,6 +18,7 @@ from .ecs_infra import (
 )
 from .lib.ecr_utils import get_image_entrypoint
 from .lib.ecs_utils import (
+    extract_task_definition_family,
     get_cluster_arn,
     infer_network_from_cluster,
     list_cluster_task_definitions,
@@ -37,6 +38,7 @@ class ECSConfig(BaseModel):
     log_group: str | None = None
     subnet_ids: list[str] | None = None
     security_group_ids: list[str] | None = None
+    assign_public_ip: str = "ENABLED"
     cpu: str = "256"
     memory: str = "512"
     execution_role_arn: str | None = None
@@ -475,6 +477,9 @@ def _resolve_ecs_config(
     memory: str,
     script_type: str,
     create_cluster: bool,
+    container_name: str | None = None,
+    log_group: str | None = None,
+    assign_public_ip: str = "ENABLED",
 ) -> ECSConfig:
     """
     Resolve all ECS configuration before running.
@@ -489,6 +494,7 @@ def _resolve_ecs_config(
         cpu=cpu,
         memory=memory,
         needs_new_task_def=not task_definition,
+        assign_public_ip=assign_public_ip,
     )
 
     print("[cloud_run] Resolving ECS configuration...", file=sys.stderr)
@@ -507,67 +513,84 @@ def _resolve_ecs_config(
 
     # 2. Resolve task definition
     if task_definition:
-        try:
-            response = ecs.describe_task_definition(taskDefinition=task_definition)
-            task_def_info = response.get("taskDefinition", {})
-            containers = task_def_info.get("containerDefinitions", [])
-
-            if not containers:
-                raise RuntimeError("Task definition has no containers")
-
-            config.task_def_arn = task_def_info.get("taskDefinitionArn")
-            config.task_family = task_def_info.get("family", "unknown")
-            config.container_name = containers[0].get("name")
-
-            # Extract log group
-            log_config = containers[0].get("logConfiguration", {})
-            if log_config.get("logDriver") == "awslogs":
-                config.log_group = log_config.get("options", {}).get("awslogs-group")
-            if not config.log_group:
-                config.log_group = f"/ecs/{config.task_family}"
-
+        if container_name:
+            family = extract_task_definition_family(task_definition)
+            config.task_def_arn = task_definition
+            config.task_family = family
+            config.container_name = container_name
+            config.log_group = log_group or f"/ecs/{family}"
             print(f"[cloud_run]   Task definition: {task_definition} ✓", file=sys.stderr)
+            print(
+                "[cloud_run]   Skipped DescribeTaskDefinition (--container-name provided)",
+                file=sys.stderr,
+            )
             print(f"[cloud_run]   Container: {config.container_name}", file=sys.stderr)
+            if log_group:
+                print(f"[cloud_run]   Log group: {config.log_group}", file=sys.stderr)
+        else:
+            try:
+                response = ecs.describe_task_definition(taskDefinition=task_definition)
+                task_def_info = response.get("taskDefinition", {})
+                containers = task_def_info.get("containerDefinitions", [])
 
-            # Check for potential issues and warn (but proceed since user specified explicitly)
-            warnings = []
+                if not containers:
+                    raise RuntimeError("Task definition has no containers")
 
-            # Check for multiple containers (sidecars)
-            if len(containers) > 1:
-                container_names = [c.get("name", "?") for c in containers]
-                warnings.append(f"Has {len(containers)} containers: {container_names}")
-                warnings.append("Only the first container's command will be overridden")
-                warnings.append("Other containers (sidecars) will run with their default commands")
+                config.task_def_arn = task_def_info.get("taskDefinitionArn")
+                config.task_family = task_def_info.get("family", "unknown")
+                config.container_name = containers[0].get("name")
 
-            # Check for entrypoint override in task def
-            entrypoint = containers[0].get("entryPoint")
-            if entrypoint:
-                warnings.append(f"Has custom entryPoint: {entrypoint}")
-                warnings.append(
-                    "ECS doesn't allow overriding entryPoint - your script will run AFTER it"
-                )
+                # Extract log group
+                log_config = containers[0].get("logConfiguration", {})
+                if log_config.get("logDriver") == "awslogs":
+                    config.log_group = log_config.get("options", {}).get("awslogs-group")
+                if not config.log_group:
+                    config.log_group = f"/ecs/{config.task_family}"
 
-            # Check image entrypoint
-            image = containers[0].get("image", "")
-            if image:
-                image_info = get_image_entrypoint(image, region)
-                if image_info and image_info.get("safe") is False:
-                    warnings.append(f"Image {image_info.get('reason')}")
+                print(f"[cloud_run]   Task definition: {task_definition} ✓", file=sys.stderr)
+                print(f"[cloud_run]   Container: {config.container_name}", file=sys.stderr)
+
+                # Check for potential issues and warn (but proceed since user specified explicitly)
+                warnings = []
+
+                # Check for multiple containers (sidecars)
+                if len(containers) > 1:
+                    container_names = [c.get("name", "?") for c in containers]
+                    warnings.append(f"Has {len(containers)} containers: {container_names}")
+                    warnings.append("Only the first container's command will be overridden")
                     warnings.append(
-                        "ECS doesn't allow overriding entryPoint - your script may not run correctly"
+                        "Other containers (sidecars) will run with their default commands"
                     )
 
-            if warnings:
-                print("[cloud_run]   ⚠ Warnings:", file=sys.stderr)
-                for w in warnings:
-                    print(f"[cloud_run]     - {w}", file=sys.stderr)
-                print(
-                    "[cloud_run]   Proceeding anyway (--task-definition was explicit)",
-                    file=sys.stderr,
-                )
+                # Check for entrypoint override in task def
+                entrypoint = containers[0].get("entryPoint")
+                if entrypoint:
+                    warnings.append(f"Has custom entryPoint: {entrypoint}")
+                    warnings.append(
+                        "ECS doesn't allow overriding entryPoint - your script will run AFTER it"
+                    )
 
-        except ecs.exceptions.ClientException as e:
-            raise RuntimeError(f"Task definition '{task_definition}' not found: {e}")
+                # Check image entrypoint
+                image = containers[0].get("image", "")
+                if image:
+                    image_info = get_image_entrypoint(image, region)
+                    if image_info and image_info.get("safe") is False:
+                        warnings.append(f"Image {image_info.get('reason')}")
+                        warnings.append(
+                            "ECS doesn't allow overriding entryPoint - your script may not run correctly"
+                        )
+
+                if warnings:
+                    print("[cloud_run]   ⚠ Warnings:", file=sys.stderr)
+                    for w in warnings:
+                        print(f"[cloud_run]     - {w}", file=sys.stderr)
+                    print(
+                        "[cloud_run]   Proceeding anyway (--task-definition was explicit)",
+                        file=sys.stderr,
+                    )
+
+            except ecs.exceptions.ClientException as e:
+                raise RuntimeError(f"Task definition '{task_definition}' not found: {e}")
     else:
         # No task definition specified - list available ones and ask user to choose
         if cluster_arn:
@@ -666,10 +689,20 @@ def _resolve_ecs_config(
                 file=sys.stderr,
             )
     else:
+        hint = (
+            "Run 'cloud_run --list-vpcs' to see available VPCs and subnets."
+        )
+        if container_name:
+            hint = (
+                "Roles without ecs:DescribeServices / ec2:DescribeSubnets cannot infer "
+                "network config from the cluster. Pass --subnets and --security-groups "
+                "explicitly (see README for Scaffold prod examples).\n"
+                + hint
+            )
         raise RuntimeError(
             "Could not determine subnets. Provide --subnets or --vpc, "
             "or ensure a service is running in the cluster.\n"
-            "Run 'cloud_run --list-vpcs' to see available VPCs and subnets."
+            + hint
         )
 
     print("[cloud_run] Configuration resolved ✓", file=sys.stderr)
@@ -692,6 +725,9 @@ def run_on_ecs(
     env_vars: dict[str, str] | None = None,
     secrets: list[str] | None = None,
     runtime_secrets: list[str] | None = None,
+    container_name: str | None = None,
+    log_group: str | None = None,
+    assign_public_ip: str = "ENABLED",
 ) -> None:
     """Run script on ECS Fargate."""
     if not cluster:
@@ -710,6 +746,9 @@ def run_on_ecs(
             memory=memory,
             script_type=script_type,
             create_cluster=create_cluster,
+            container_name=container_name,
+            log_group=log_group,
+            assign_public_ip=assign_public_ip,
         )
 
         # Phase 2: Create any missing infrastructure
@@ -768,6 +807,7 @@ def run_on_ecs(
             secrets=secrets,
             runtime_secrets=runtime_secrets,
             container_name=config.container_name,
+            assign_public_ip=config.assign_public_ip,
             region_name=region,
         )
         task_id = task_arn.split("/")[-1]

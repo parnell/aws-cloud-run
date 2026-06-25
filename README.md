@@ -86,6 +86,18 @@ Use an existing task definition:
 uv run cloud_run examples/hello.py --ecs --cluster my-ecs-cluster --task-definition my-family:12
 ```
 
+When your IAM role lacks `ecs:DescribeTaskDefinition` (e.g. Scaffold task-runner SSO), pass the container name explicitly. `--log-group` is optional and defaults to `/ecs/<family>`. Task-runner also cannot infer subnets from the cluster — pass network config explicitly (same values as `run_ecs_task.py` for prod):
+
+```bash
+uv run cloud_run examples/hello.py --ecs --cluster scaffold-prod-ecs-cluster \
+  --task-definition scaffold-prod-analyze-job \
+  --container-name scaffold-prod-analyze-job \
+  --log-group /scaffold/prod/app-log-group \
+  --subnets subnet-04c898c816719788b,subnet-01a214e33fc40745d,subnet-0b3582fd6e3e292bf \
+  --security-groups sg-016da43d0257b500e \
+  --assign-public-ip disabled
+```
+
 ### ECS Discovery Commands
 
 ```bash
