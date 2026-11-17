@@ -404,7 +404,7 @@ def run_ecs_task(
 
     # Build network configuration
     network_config = {
-        "subnets": subnet_ids[:3],  # Use up to 3 subnets
+        "subnets": subnet_ids,
         "assignPublicIp": assign_public_ip,
     }
     if security_group_ids:

@@ -16,6 +16,7 @@ from .ecs_infra import (
     run_ecs_task,
     wait_for_task_completion,
 )
+from .lib.aws_auth import aws_auth_error_message, is_aws_auth_error
 from .lib.ecr_utils import get_image_entrypoint
 from .lib.ecs_utils import (
     extract_task_definition_family,
@@ -45,61 +46,68 @@ class ECSConfig(BaseModel):
     needs_new_task_def: bool = False
 
 
+# One launch decides how many subnets to pass. Fargate accepts more; three is the cap we keep.
+_MAX_SUBNETS = 3
+
+
 def resolve_vpc_and_subnets(
     region: str,
     vpc_name_or_id: str | None,
     subnet_ids: list[str] | None,
 ) -> list[str]:
-    """Resolve VPC name/ID to subnet IDs.
+    """Resolve a VPC name or ID to every preferred subnet in it.
 
-    Returns list of subnet IDs to use.
+    Public subnets win over private ones. The caller applies the subnet cap.
+    Raises RuntimeError when the VPC cannot be resolved.
     """
-    ec2 = boto3.client("ec2", region_name=region)
-
-    # If subnets explicitly provided, use them
     if subnet_ids:
         return subnet_ids
 
-    # Need VPC to find subnets
     if not vpc_name_or_id:
-        print("Error: --vpc or --subnets is required for ECS tasks.", file=sys.stderr)
-        print("       Run 'cloud_run --list-vpcs' to see available VPCs.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(
+            "--vpc or --subnets is required for ECS tasks. "
+            "Run 'cloud_run --list-vpcs' to see available VPCs."
+        )
 
-    # Check if it's a VPC ID or name
-    if vpc_name_or_id.startswith("vpc-"):
-        vpc_id = vpc_name_or_id
-    else:
-        # Search by name tag
-        vpcs = ec2.describe_vpcs(Filters=[{"Name": "tag:Name", "Values": [vpc_name_or_id]}])
-        if not vpcs["Vpcs"]:
-            print(f"Error: VPC '{vpc_name_or_id}' not found.", file=sys.stderr)
-            print("       Run 'cloud_run --list-vpcs' to see available VPCs.", file=sys.stderr)
-            sys.exit(1)
-        if len(vpcs["Vpcs"]) > 1:
-            print(f"Error: Multiple VPCs found with name '{vpc_name_or_id}':", file=sys.stderr)
-            for vpc in vpcs["Vpcs"]:
-                print(f"       - {vpc['VpcId']}", file=sys.stderr)
-            print("       Please specify the VPC ID directly with --vpc vpc-xxx", file=sys.stderr)
-            sys.exit(1)
-        vpc_id = vpcs["Vpcs"][0]["VpcId"]
+    ec2 = boto3.client("ec2", region_name=region)
 
-    print(f"[cloud_run] VPC: {vpc_id}", file=sys.stderr)
+    try:
+        if vpc_name_or_id.startswith("vpc-"):
+            vpc_id = vpc_name_or_id
+        else:
+            vpcs = ec2.describe_vpcs(Filters=[{"Name": "tag:Name", "Values": [vpc_name_or_id]}])
+            matches = vpcs["Vpcs"]
+            if not matches:
+                raise RuntimeError(
+                    f"VPC '{vpc_name_or_id}' not found. "
+                    "Run 'cloud_run --list-vpcs' to see available VPCs."
+                )
+            if len(matches) > 1:
+                ids = ", ".join(vpc["VpcId"] for vpc in matches)
+                raise RuntimeError(
+                    f"Multiple VPCs found with name '{vpc_name_or_id}': {ids}. "
+                    "Specify the VPC ID with --vpc vpc-xxx."
+                )
+            vpc_id = matches[0]["VpcId"]
 
-    # Get subnets - prefer public subnets first
-    subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+        print(f"[cloud_run] VPC: {vpc_id}", file=sys.stderr)
+        subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+    except RuntimeError:
+        raise
+    except Exception as e:
+        if is_aws_auth_error(e):
+            raise RuntimeError(aws_auth_error_message()) from e
+        raise RuntimeError(f"Failed to resolve VPC '{vpc_name_or_id}': {e}") from e
 
-    if not subnets["Subnets"]:
-        print(f"Error: No subnets found in VPC {vpc_id}", file=sys.stderr)
-        sys.exit(1)
+    found = subnets["Subnets"]
+    if not found:
+        raise RuntimeError(f"No subnets found in VPC {vpc_id}")
 
-    # Categorize subnets
     public_subnets = []
     private_subnets = []
 
-    for subnet in subnets["Subnets"]:
+    for subnet in found:
         subnet_id = subnet["SubnetId"]
-        # Check if it's a public subnet (by name convention or MapPublicIpOnLaunch)
         subnet_name = ""
         for tag in subnet.get("Tags", []):
             if tag["Key"] == "Name":
@@ -111,22 +119,18 @@ def resolve_vpc_and_subnets(
         else:
             private_subnets.append(subnet_id)
 
-    # Use public subnets if available, otherwise private
-    # For Fargate with assignPublicIp=ENABLED, public subnets work best
+    # Public subnets work with assignPublicIp=ENABLED. Private ones need a NAT gateway.
     if public_subnets:
-        selected = public_subnets[:3]  # Use up to 3 subnets for availability
-        print(f"[cloud_run] Using {len(selected)} public subnet(s)", file=sys.stderr)
-        return selected
-    elif private_subnets:
-        selected = private_subnets[:3]
+        print(f"[cloud_run] Found {len(public_subnets)} public subnet(s)", file=sys.stderr)
+        return public_subnets
+    if private_subnets:
         print(
-            f"[cloud_run] Using {len(selected)} private subnet(s) (may need NAT gateway)",
+            f"[cloud_run] Found {len(private_subnets)} private subnet(s) (may need NAT gateway)",
             file=sys.stderr,
         )
-        return selected
-    else:
-        print(f"Error: No suitable subnets found in VPC {vpc_id}", file=sys.stderr)
-        sys.exit(1)
+        return private_subnets
+
+    raise RuntimeError(f"No suitable subnets found in VPC {vpc_id}")
 
 
 def list_vpcs(region: str) -> None:
@@ -657,15 +661,9 @@ def _resolve_ecs_config(
         network_source = "provided"
     # Then try VPC
     elif vpc_name_or_id:
-        try:
-            resolved_subnets = resolve_vpc_and_subnets(region, vpc_name_or_id, None)
-            resolved_security_groups = security_group_ids
-            network_source = f"VPC {vpc_name_or_id}"
-        except Exception as e:
-            print(
-                f"[cloud_run]   Warning: Could not resolve VPC {vpc_name_or_id}: {e}",
-                file=sys.stderr,
-            )
+        resolved_subnets = resolve_vpc_and_subnets(region, vpc_name_or_id, None)
+        resolved_security_groups = security_group_ids
+        network_source = f"VPC {vpc_name_or_id}"
 
     # Then try to infer from cluster's services/tasks
     if not resolved_subnets and cluster_arn:
@@ -677,6 +675,12 @@ def _resolve_ecs_config(
             network_source = f"inferred from {network_config['source']}"
 
     if resolved_subnets:
+        if len(resolved_subnets) > _MAX_SUBNETS:
+            print(
+                f"[cloud_run]   Using {_MAX_SUBNETS} of {len(resolved_subnets)} subnets",
+                file=sys.stderr,
+            )
+            resolved_subnets = resolved_subnets[:_MAX_SUBNETS]
         config.subnet_ids = resolved_subnets
         config.security_group_ids = resolved_security_groups
         print(

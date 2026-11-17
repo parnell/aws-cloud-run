@@ -78,7 +78,9 @@ def list_cluster_task_definitions(ecs, cluster_arn: str, region: str) -> list[di
         for family, task_info in seen_families.items():
             try:
                 response = ecs.describe_task_definition(taskDefinition=task_info["task_def_arn"])
-            except Exception:
+            except Exception as e:
+                if is_aws_auth_error(e):
+                    raise
                 continue
 
             task_def = response.get("taskDefinition", {})
@@ -139,8 +141,14 @@ def list_cluster_task_definitions(ecs, cluster_arn: str, region: str) -> list[di
         # Sort: usable first, then running, then by name
         results.sort(key=lambda x: (not x["usable"], x["status"] != "running", x["family"]))
         return results
-    except Exception:
-        return []
+    except RuntimeError:
+        raise
+    except Exception as e:
+        if is_aws_auth_error(e):
+            raise RuntimeError(aws_auth_error_message()) from e
+        raise RuntimeError(
+            f"Failed to list task definitions for cluster '{cluster_arn}': {e}"
+        ) from e
 
 
 def infer_network_from_cluster(ecs, cluster_arn: str) -> dict | None:
