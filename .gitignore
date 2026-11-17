@@ -11,3 +11,6 @@ wheels/
 
 # Cloud run logs
 logs/
+
+#dev
+.private
