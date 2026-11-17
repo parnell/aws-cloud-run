@@ -142,21 +142,9 @@ def run_on_lambda(
         )
         print("[cloud_run] Lambda function deployed", file=sys.stderr)
 
-        # Invoke Lambda with script content as plain JSON
+        # Invoke Lambda with script content as plain JSON. ensure_lambda returns Active.
         lambda_client = boto3.client("lambda", region_name=region)
 
-        # Wait for function to be ready
-        print("[cloud_run] Waiting for function to be ready...", file=sys.stderr)
-        for _ in range(30):
-            resp = lambda_client.get_function(FunctionName=function_name)
-            state = resp["Configuration"]["State"]
-            if state == "Active":
-                print("[cloud_run] Function is Active", file=sys.stderr)
-                break
-            print(f"[cloud_run] Function state: {state}, waiting...", file=sys.stderr)
-            time.sleep(1)
-
-        # Invoke
         event = {
             "script_content": script_content,
             "args": list(script_args),

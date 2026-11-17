@@ -6,12 +6,8 @@ from pathlib import Path
 
 import boto3
 
-from .ecs_runner import (
-    list_ecs_tasks,
-    list_task_definitions,
-    list_vpcs,
-    run_on_ecs,
-)
+from .discovery import list_ecs_tasks, list_task_definitions, list_vpcs
+from .ecs_runner import run_on_ecs
 from .lambda_runner import run_on_lambda
 
 

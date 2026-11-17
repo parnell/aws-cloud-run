@@ -4,7 +4,6 @@ import base64
 import json
 import re
 import sys
-import time
 from typing import Any
 
 import boto3
@@ -64,32 +63,6 @@ def _default_function_name(func: Any) -> str:
     # Lambda name constraints: letters, numbers, hyphens; <= 64 chars
     safe = re.sub(r"[^A-Za-z0-9-]", "-", raw)
     return safe[:64]
-
-
-def _wait_for_lambda_ready(lambda_client: Any, function_name: str, max_wait: int = 60) -> None:
-    """Wait for Lambda function to be in Active state before invoking."""
-    start_time = time.time()
-    while time.time() - start_time < max_wait:
-        try:
-            response = lambda_client.get_function(FunctionName=function_name)
-            state = response["Configuration"]["State"]
-            if state == "Active":
-                return
-            elif state in ("Failed", "Inactive"):
-                raise RuntimeError(f"Lambda function {function_name} is in {state} state")
-            # State is Pending or PendingUpdate, wait a bit
-            time.sleep(1)
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code")
-            if error_code == "ResourceNotFoundException":
-                # Function might not be created yet, wait a bit
-                time.sleep(1)
-            else:
-                raise
-
-    raise RuntimeError(
-        f"Lambda function {function_name} did not become Active within {max_wait} seconds"
-    )
 
 
 def run(
@@ -156,9 +129,7 @@ def run(
         architecture=architecture,
     )
 
-    # Wait for Lambda function to be ready (Active state)
     lambda_client = boto3.client("lambda", region_name=region_name)
-    _wait_for_lambda_ready(lambda_client, function_name)
 
     # Prepare invocation payload: base64-encoded cloudpickle of (args, kwargs)
     payload = base64.b64encode(cloudpickle.dumps((args, kwargs))).decode("utf-8")

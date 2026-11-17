@@ -99,6 +99,38 @@ def ensure_role(role_name: str, region_name: str | None = None) -> str:
     return role["Arn"]
 
 
+# Create and update both return only when the function is Active. Callers invoke.
+_LAMBDA_READY_TIMEOUT_SECONDS = 60
+
+
+def _poll_lambda_state(lambda_client, function_name: str, *, ready: frozenset[str]) -> str:
+    """Poll GetFunction until state is in ready. Return the function ARN.
+
+    Failed is an error. Any other state waits out the ready timeout.
+    Active and Inactive are ready for a configuration change; only Active is
+    ready to return to a caller that will invoke.
+    """
+    deadline = time.time() + _LAMBDA_READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        try:
+            configuration = lambda_client.get_function(FunctionName=function_name)["Configuration"]
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                time.sleep(1)
+                continue
+            raise
+        state = configuration["State"]
+        if state == "Failed":
+            raise RuntimeError(f"Lambda function {function_name} is in Failed state")
+        if state in ready:
+            return configuration["FunctionArn"]
+        time.sleep(1)
+    raise RuntimeError(
+        f"Lambda function {function_name} did not become Active within "
+        f"{_LAMBDA_READY_TIMEOUT_SECONDS} seconds"
+    )
+
+
 def ensure_lambda(
     *,
     function_name: str,
@@ -111,12 +143,12 @@ def ensure_lambda(
     ephemeral_storage_mb: int = 512,
     architecture: str = "x86_64",
 ) -> str:
-    """Ensure a Lambda function exists with the provided code; return its ARN."""
+    """Ensure a Lambda function exists and is Active; return its ARN."""
 
     lambda_client = boto3.client("lambda", region_name=region_name)
 
     try:
-        get_resp = lambda_client.get_function(FunctionName=function_name)
+        lambda_client.get_function(FunctionName=function_name)
         exists = True
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
@@ -125,33 +157,18 @@ def ensure_lambda(
             raise
 
     if exists:
-        # Update function code
         lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
+        # Configuration updates are rejected while a code update is still pending.
+        _poll_lambda_state(
+            lambda_client,
+            function_name,
+            ready=frozenset({"Active", "Inactive"}),
+        )
 
-        # Wait for code update to complete before updating configuration
-        # Lambda can be in PendingUpdate state after code update
-        max_wait = 60
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            try:
-                func_resp = lambda_client.get_function(FunctionName=function_name)
-                state = func_resp["Configuration"]["State"]
-                if state in ("Active", "Inactive"):
-                    break
-                elif state == "Failed":
-                    raise RuntimeError(f"Lambda function {function_name} is in Failed state")
-                # State is Pending or PendingUpdate, wait a bit
-                time.sleep(1)
-            except ClientError:
-                # If we can't get the function, wait and retry
-                time.sleep(1)
-
-        # Now update configuration
-        # Retry if there's a conflict (update in progress)
         max_config_retries = 10
         for attempt in range(max_config_retries):
             try:
-                # Note: Architectures cannot be changed after creation, so we don't include it in update
+                # Architectures cannot be changed after creation, so omit them here.
                 lambda_client.update_function_configuration(
                     FunctionName=function_name,
                     Role=role_arn,
@@ -165,26 +182,21 @@ def ensure_lambda(
             except ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code")
                 if error_code == "ResourceConflictException" and attempt < max_config_retries - 1:
-                    # Wait a bit and retry
                     time.sleep(2)
                     continue
                 raise
-        # Get the updated function ARN
-        final_resp = lambda_client.get_function(FunctionName=function_name)
-        arn = final_resp["Configuration"]["FunctionArn"]
-        return arn
+    else:
+        lambda_client.create_function(
+            FunctionName=function_name,
+            Role=role_arn,
+            Runtime=runtime,
+            Handler="handler.lambda_handler",
+            Code={"ZipFile": zip_bytes},
+            Timeout=timeout,
+            MemorySize=memory_size,
+            EphemeralStorage={"Size": ephemeral_storage_mb},
+            Architectures=[architecture],
+            Publish=True,
+        )
 
-    # Create
-    create_resp = lambda_client.create_function(
-        FunctionName=function_name,
-        Role=role_arn,
-        Runtime=runtime,
-        Handler="handler.lambda_handler",
-        Code={"ZipFile": zip_bytes},
-        Timeout=timeout,
-        MemorySize=memory_size,
-        EphemeralStorage={"Size": ephemeral_storage_mb},
-        Architectures=[architecture],
-        Publish=True,
-    )
-    return create_resp["FunctionArn"]
+    return _poll_lambda_state(lambda_client, function_name, ready=frozenset({"Active"}))
